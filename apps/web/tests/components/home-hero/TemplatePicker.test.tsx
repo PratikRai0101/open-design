@@ -94,6 +94,19 @@ describe('TemplatePicker', () => {
     expect(document.activeElement).toBe(trigger);
   });
 
+  it('keeps an open menu when the host settles its default type', () => {
+    // HomeView seeds the default type (Prototype) one effect tick after the
+    // plugin catalog loads. A picker the user opened in that window used to
+    // snap shut when the settle landed, which is the race the HomeView specs
+    // hit in CI (they click the trigger and query the menu in the same tick).
+    const props = { templates, activeChipId: null, labelFor };
+    const { rerender } = render(<TemplatePicker {...props} />);
+    fireEvent.click(screen.getByTestId('home-hero-template-trigger').querySelector('button')!);
+    expect(screen.getByRole('listbox')).toBeTruthy();
+    rerender(<TemplatePicker {...props} activeChipId="prototype" />);
+    expect(screen.getByRole('listbox')).toBeTruthy();
+  });
+
   it('closes an open menu when loading disables the picker', () => {
     const props = { templates, activeChipId: 'prototype', labelFor };
     const { rerender } = render(<TemplatePicker {...props} />);
