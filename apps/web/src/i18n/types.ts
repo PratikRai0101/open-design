@@ -288,6 +288,7 @@ export interface Dict {
   'settings.onboardingCloudContinue': string;
   'settings.onboardingCloudAlternative': string;
   'settings.onboardingCloudOr': string;
+  'settings.onboardingCloudCancel': string;
   'settings.onboardingCloudRights': string;
   'settings.onboardingGateTooltipNoRuntime': string;
   'settings.onboardingGateTooltipAmr': string;
