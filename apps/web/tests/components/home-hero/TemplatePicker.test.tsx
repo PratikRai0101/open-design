@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { useLayoutEffect } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { TemplatePicker } from '../../../src/components/home-hero/TemplatePicker';
@@ -94,16 +95,15 @@ describe('TemplatePicker', () => {
     expect(document.activeElement).toBe(trigger);
   });
 
-  it('keeps an open menu when the host settles its default type', () => {
-    // HomeView seeds the default type (Prototype) one effect tick after the
-    // plugin catalog loads. A picker the user opened in that window used to
-    // snap shut when the settle landed, which is the race the HomeView specs
-    // hit in CI (they click the trigger and query the menu in the same tick).
-    const props = { templates, activeChipId: null, labelFor };
-    const { rerender } = render(<TemplatePicker {...props} />);
-    fireEvent.click(screen.getByTestId('home-hero-template-trigger').querySelector('button')!);
-    expect(screen.getByRole('listbox')).toBeTruthy();
-    rerender(<TemplatePicker {...props} activeChipId="prototype" />);
+  it('keeps a click made as the picker becomes enabled before passive effects flush', () => {
+    function ReadyPicker({ disabled }: { disabled: boolean }) {
+      useLayoutEffect(() => {
+        if (!disabled) screen.getByTestId('home-hero-template-trigger').querySelector('button')!.click();
+      }, [disabled]);
+      return <TemplatePicker templates={templates} activeChipId="prototype" labelFor={labelFor} disabled={disabled} />;
+    }
+    const { rerender } = render(<ReadyPicker disabled />);
+    rerender(<ReadyPicker disabled={false} />);
     expect(screen.getByRole('listbox')).toBeTruthy();
   });
 
@@ -115,6 +115,35 @@ describe('TemplatePicker', () => {
     rerender(<TemplatePicker {...props} disabled />);
     expect(screen.queryByRole('listbox')).toBeNull();
     expect(screen.getByTestId('home-hero-template-trigger').querySelector('button')!.disabled).toBe(true);
+  });
+
+  it('keeps a menu opened after a committed type change open', () => {
+    // On a loaded machine React commits a render and runs its passive effects
+    // in separate tasks, so a click can land on a trigger that already shows
+    // the new type before that commit's effects run. Opening the menu there is
+    // a fresh intent; the type change the user already saw must not close it.
+    // The layout effect below clicks at exactly that point: after the commit,
+    // before its passive effects.
+    function ClickAfterCommit({ activeChipId }: { activeChipId: string | null }) {
+      useLayoutEffect(() => {
+        if (activeChipId !== 'prototype') return;
+        screen.getByTestId('home-hero-template-trigger').querySelector('button')!.click();
+      }, [activeChipId]);
+      return null;
+    }
+    function Host({ activeChipId }: { activeChipId: string | null }) {
+      return (
+        <>
+          <TemplatePicker templates={templates} activeChipId={activeChipId} labelFor={labelFor} />
+          <ClickAfterCommit activeChipId={activeChipId} />
+        </>
+      );
+    }
+    const { rerender } = render(<Host activeChipId={null} />);
+    rerender(<Host activeChipId="prototype" />);
+
+    expect(screen.getByTestId('home-hero-template-trigger').textContent).toContain(labelFor('prototype'));
+    expect(screen.queryByTestId('home-hero-template-menu')).not.toBeNull();
   });
 
   it('offers no clear when the host supplies no handler', () => {

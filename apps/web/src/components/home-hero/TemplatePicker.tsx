@@ -42,12 +42,15 @@ export function TemplatePicker({
       document.removeEventListener('keydown', escape);
     };
   }, [open]);
-  // Close only when the composer takes the picker away. NOT on an
-  // `activeChipId` change: HomeView seeds its default type one effect tick
-  // after the plugin catalog loads, and closing on that async settle snaps an
-  // already-open menu shut under the user (and races the HomeView specs). A
-  // real pick already closes the menu from the option handler.
-  useEffect(() => { setOpen(false); }, [disabled]);
+  // A type change or a disable closes the menu in the render that shows it, not
+  // in a later effect: passive effects can run after the user has already
+  // clicked the updated trigger, and would then close the menu that click just
+  // opened.
+  const [shownFor, setShownFor] = useState({ activeChipId, disabled });
+  if (shownFor.activeChipId !== activeChipId || shownFor.disabled !== disabled) {
+    setShownFor({ activeChipId, disabled });
+    setOpen(false);
+  }
   const active = templates.find((chip) => chip.id === activeChipId) ?? null;
 
   const valueLabel = active ? labelFor(active.id) : t('homeHero.templatePicker.label');
