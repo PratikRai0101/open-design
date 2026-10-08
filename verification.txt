@@ -1,0 +1,111 @@
+Issue #8596: artifact delivery verification
+Fix commit: cedadc759cfd748e46a265c8144d0d56512dc0cc
+Main baseline: e38462fd50ef8c911c50acc9ccd4b11186655ed9
+Runtime: Node 24.18.0; pnpm 10.33.2
+
+Core reproduction: real daemon HTTP/SSE, a real spawned CLI writing a PNG,
+and an immediate SQLite-backed message GET after end, with no browser PUT.
+The initial six-case red suite ran before production edits on the main baseline.
+It was then expanded with plain-stream and empty-placeholder controls.
+
+RED: initial daemon regressions before production edits
+$ pnpm --filter @open-design/daemon exec vitest run tests/run-failed-artifact-delivery.test.ts
+ ❯ tests/run-failed-artifact-delivery.test.ts (6 tests | 4 failed) 3797ms
+     × accepts an artifact-only clean exit (existing artifact: false) 985ms
+     × accepts an artifact-only clean exit (existing artifact: true) 535ms
+     × keeps the artifact and the failure for a 'nonzero process exit' 197ms
+     × keeps the artifact and the failure for a 'explicit stream error with exit zero' 216ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 4 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  tests/run-failed-artifact-delivery.test.ts > artifact delivery is independent of a run failure (#8596) > accepts an artifact-only clean exit (existing artifact: false)
+ FAIL  tests/run-failed-artifact-delivery.test.ts > artifact delivery is independent of a run failure (#8596) > accepts an artifact-only clean exit (existing artifact: true)
+AssertionError: expected 'failed' to be 'succeeded' // Object.is equality
+
+Expected: "succeeded"
+Received: "failed"
+
+ ❯ tests/run-failed-artifact-delivery.test.ts:116:27
+    114|     expect(status.artifactPaths).toEqual([ARTIFACT]);
+    115|     expect(status.artifactCount).toBe(1);
+    116|     expect(status.status).toBe('succeeded');
+       |                           ^
+    117|     expect(message.runStatus).toBe('succeeded');
+    118|     expect(message.content).toBe('');
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/4]⎯
+
+ FAIL  tests/run-failed-artifact-delivery.test.ts > artifact delivery is independent of a run failure (#8596) > keeps the artifact and the failure for a 'nonzero process exit'
+ FAIL  tests/run-failed-artifact-delivery.test.ts > artifact delivery is independent of a run failure (#8596) > keeps the artifact and the failure for a 'explicit stream error with exit zero'
+AssertionError: expected undefined to deeply equal [ 'wallpaper-capybara.png' ]
+
+- Expected:
+[
+  "wallpaper-capybara.png",
+]
+
++ Received:
+undefined
+
+ ❯ tests/run-failed-artifact-delivery.test.ts:134:61
+    132|     expect(status.artifactPaths).toEqual([ARTIFACT]);
+    133|     expect(status.artifactCount).toBe(1);
+    134|     expect(message.producedFiles?.map((file) => file.name)).toEqual([A…
+       |                                                             ^
+    135|     expect(status.failureCategory).not.toBe('empty_output');
+    136|   });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/4]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  4 failed | 2 passed (6)
+   Start at  23:30:21
+   Duration  7.48s (transform 2.78s, setup 16ms, import 3.60s, tests 3.80s, environment 0ms)
+
+undefined
+<repo>/apps/daemon:
+ ERR_PNPM_RECURSIVE_EXEC_FIRST_FAIL  Command failed with exit code 1: vitest run tests/run-failed-artifact-delivery.test.ts
+
+GREEN: final daemon issue suite
+$ pnpm --filter @open-design/daemon exec vitest run tests/run-failed-artifact-delivery.test.ts
+
+ RUN  v4.1.6 <repo>/apps/daemon
+
+
+ Test Files  1 passed (1)
+      Tests  8 passed (8)
+   Start at  23:48:14
+   Duration  11.98s (transform 4.28s, setup 36ms, import 5.49s, tests 6.31s, environment 0ms)
+
+
+GREEN: final web issue suites
+$ pnpm --filter @open-design/web exec vitest run tests/components/ChatPane.failed-artifact-delivery.test.tsx tests/components/ProjectView.failed-artifact-delivery.test.tsx
+
+ RUN  v4.1.6 <repo>/apps/web
+
+
+ Test Files  2 passed (2)
+      Tests  6 passed (6)
+   Start at  23:53:16
+   Duration  7.99s (transform 8.12s, setup 1.67s, import 8.79s, tests 854ms, environment 1.88s)
+
+
+GREEN: real browser acceptance
+$ pnpm --filter @open-design/e2e exec playwright test -c playwright.config.ts ui/failed-artifact-delivery.test.ts --workers=1 --trace=on
+Running 2 tests using 1 worker
+  ✓  1 [chromium] › ui/failed-artifact-delivery.test.ts:10:3 › [P1] artifact-only daemon run keeps its image usable after reload (#8596) (12.6s)
+  ✓  2 [chromium] › ui/failed-artifact-delivery.test.ts:10:3 › [P1] failed daemon run keeps its image usable after reload (#8596) (10.4s)
+  2 passed (42.5s)
+
+Other successful validation (exit code 0 checked):
+- pnpm guard
+- pnpm typecheck
+- pnpm --filter @open-design/daemon build
+- pnpm --filter @open-design/e2e typecheck
+- git diff --check
+
+Browser cases use a deterministic OpenCode fixture with real daemon and web runtimes.
+Both cases verify durable association, chat visibility after reload, Open, raw PNG
+bytes and MIME, and a real download with the expected filename.
+The screenshots show the complete project entry point after reload.
