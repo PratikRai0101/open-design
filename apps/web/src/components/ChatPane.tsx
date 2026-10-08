@@ -2447,8 +2447,19 @@ export function ChatPane({
     }
     return null;
   })();
+  const failureArtifactNames = [...new Set(
+    (retryAssistant?.producedFiles ?? []).map((file) => file.name).filter(Boolean),
+  )].join(', ');
+  const missingSummaryWithArtifacts = Boolean(
+    !accessErrorCopy && failureArtifactNames
+    && retryAssistant?.producedFiles?.some((file) => file.size > 0)
+    && runFailureUi?.titleKey === 'chat.runError.title.emptyOutput',
+  );
   const displayError = (() => {
     if (accessErrorCopy) return t(accessErrorCopy.messageKey);
+    if (cardDescription.render !== 'none' && missingSummaryWithArtifacts) {
+      return t('chat.runError.artifactsWithoutSummaryMessage', { files: failureArtifactNames });
+    }
     switch (cardDescription.render) {
       case 'none': return null;
       case 'mapped': return t(cardDescription.messageKey, runFailureCopyVars);
@@ -2467,7 +2478,9 @@ export function ChatPane({
 
   const displayErrorTitle = accessErrorCopy
     ? t(accessErrorCopy.titleKey)
-    : t(runFailureUi?.titleKey ?? 'chat.runError.title.generic', runFailureCopyVars);
+    : missingSummaryWithArtifacts
+      ? t('chat.runError.title.artifactsWithoutSummary')
+      : t(runFailureUi?.titleKey ?? 'chat.runError.title.generic', runFailureCopyVars);
   /*
    * 这张顶层报错卡代表**哪一轮**。
    *
@@ -4514,8 +4527,12 @@ export function ChatPane({
                    */
                   <RunErrorCard
                     dataKind="run-recovery"
+                    severity={missingSummaryWithArtifacts ? 'warning' : 'error'}
                     title={displayErrorTitle}
                     description={displayError}
+                    availableArtifacts={!accessErrorCopy && !missingSummaryWithArtifacts && failureArtifactNames
+                      ? t('chat.runError.availableArtifacts', { files: failureArtifactNames })
+                      : null}
                     actions={(
                       <>
                         {/* OPEND-2807: two standing actions and one runtime action. */}

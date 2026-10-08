@@ -6796,9 +6796,33 @@ export function ProjectView({
           findDetachedManualFileWrites(reattachConversationId, runId)?.dispose();
           continue;
         }
+        // Older daemons persisted terminal artifact paths without attaching
+        // them to a failed message. Recover only those authoritative paths:
+        // a historical file-list diff would also claim files from later turns.
+        // The failure, error events and retry context remain the run's verdict.
+        if (
+          spuriouslyFailedPending
+          && (status.status === 'failed' || status.status === 'canceled')
+          && status.artifactPaths?.length
+        ) {
+          const nextFiles = await refreshProjectFiles({ fresh: true });
+          if (cancelled || activeConversationIdRef.current !== reattachConversationId
+            || projectRunAuthorityKeyRef.current !== projectRunAuthorityKey) return;
+          const produced = computeProducedFiles(
+            undefined, nextFiles, status.artifactPaths, project.id, projectDetail.resolvedDir,
+          ) ?? [];
+          if (produced.length > 0) {
+            updateMessageById(message.id, (prev) =>
+              prev.runId === runId && !prev.producedFiles?.length
+                ? { ...prev, producedFiles: produced }
+                : prev,
+            true, { telemetryFinalized: true });
+          }
+        }
         if (status.strategyTask?.taskExecutionId) {
-          // A blocked verdict is stamped alongside the task handle so the
-          // turn's question form stays terminated after a reload.
+          // Keep message mutations after the recovery read: an update before
+          // its await would cancel this effect and restart the same probe.
+          // A blocked verdict also keeps this turn's question form terminated.
           const settledFields = strategySettledMessageFields(status.strategyTask);
           updateMessageById(
             message.id,
