@@ -1,0 +1,69 @@
+PR #8613 — canceled historical run recovery follow-up
+Code commit: fb9becfa3cf61006c6e201d792df497748e79d60
+Previous PR head: 2b33b81001049ef910747db08fd8ca348b8e9957
+Review: https://github.com/nexu-io/open-design/pull/8613#discussion_r4237140963
+Environment: Node 24.18.0, repository-pinned pnpm 10.33.2
+
+Before production changes, the expanded reopen regression failed for BOTH
+persisted-canceled / daemon-canceled cases (with and without strategy metadata).
+The failed-run reopen and live-failure cases still passed. The failing assertion
+was that fetchChatRunStatus must be called: the old predicate skipped canceled
+messages entirely.
+
+Command:
+fnm exec --using v24.18.0 corepack pnpm --filter @open-design/web test tests/components/ProjectView.failed-artifact-delivery.test.tsx
+
+Actual red output:
+     × recovers 'canceled'-run artifacts on reopen (strategy task: false) 3018ms
+     × recovers 'canceled'-run artifacts on reopen (strategy task: true) 3012ms
+ FAIL  tests/components/ProjectView.failed-artifact-delivery.test.tsx > issue #8596: produced artifacts on a terminal no-prose run > recovers 'canceled'-run artifacts on reopen (strategy task: false)
+AssertionError: expected "vi.fn()" to be called with arguments: [ 'run-reopened', null ]
+ FAIL  tests/components/ProjectView.failed-artifact-delivery.test.tsx > issue #8596: produced artifacts on a terminal no-prose run > recovers 'canceled'-run artifacts on reopen (strategy task: true)
+AssertionError: expected "vi.fn()" to be called with arguments: [ 'run-reopened', null ]
+ Test Files  1 failed (1)
+      Tests  2 failed | 3 passed (5)
+   Duration  10.08s (transform 2.75s, setup 506ms, import 2.93s, tests 6.18s, environment 385ms)
+
+A first implementation that widened replay also needed to preserve the user's
+Stop intent. A neighboring replacement-run test failed (1 failed / 70 passed),
+while its previous-head suite passed (60/60) and the updated isolated case passed.
+Explicit regressions showed why canceled messages must never be replayed when
+the daemon reports running or succeeded. No timeout or assertion was weakened.
+
+Actual interim Stop-regression red output:
+     × does not replay a canceled message when the daemon still reports running 55ms
+     × does not replay a canceled message when the daemon still reports succeeded 11ms
+ FAIL  tests/components/ProjectView.failed-artifact-delivery.test.tsx > issue #8596: produced artifacts on a terminal no-prose run > does not replay a canceled message when the daemon still reports running
+AssertionError: expected 'running' to be 'canceled' // Object.is equality
+ FAIL  tests/components/ProjectView.failed-artifact-delivery.test.tsx > issue #8596: produced artifacts on a terminal no-prose run > does not replay a canceled message when the daemon still reports succeeded
+AssertionError: expected undefined to be 2000 // Object.is equality
+ Test Files  1 failed (1)
+      Tests  2 failed | 5 skipped (7)
+   Duration  3.21s (transform 2.32s, setup 344ms, import 2.48s, tests 66ms, environment 249ms)
+
+Final behavior:
+- Empty failed and canceled messages with a run ID and no produced files are probed.
+- Only authoritative failed/canceled artifactPaths that exist in the fresh project
+  file list are attached; unrelated later-turn files are excluded.
+- Existing content, events, terminal verdict and endedAt are preserved.
+- A stored cancellation never reattaches its stream when the daemon has not
+  settled the cancellation; the existing failed-message replay behavior remains.
+- The recovery HTTP response is held across a React commit in all four reopen
+  cases, including both strategy metadata variants.
+
+Final command:
+fnm exec --using v24.18.0 corepack pnpm --filter @open-design/web test tests/components/ProjectView.failed-artifact-delivery.test.tsx tests/components/ChatPane.failed-artifact-delivery.test.tsx tests/components/ProjectView.reattach-restore.test.tsx tests/components/ProjectView.reattach-retry-storm.test.tsx
+
+Actual final output:
+ Test Files  4 passed (4)
+      Tests  73 passed (73)
+   Duration  7.16s (transform 3.75s, setup 938ms, import 4.45s, tests 6.41s, environment 888ms)
+
+The issue-specific ProjectView file now contains 7 passing cases; combined with
+ChatPane, the issue-specific web regressions contain 10 passing cases.
+
+Final pnpm guard: exit 0.
+Final root pnpm typecheck: exit 0.
+git diff --check: exit 0.
+Fresh GitHub CI is required for this new code commit; the prior head's green run
+37941490505 is historical evidence and does not validate this follow-up.
