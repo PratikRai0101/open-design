@@ -1,0 +1,60 @@
+PR #8613 — final green CI receipt
+Code head: fb9becfa3cf61006c6e201d792df497748e79d60
+CI run: https://github.com/nexu-io/open-design/actions/runs/38058101714
+Overall result: completed / success
+Required Validate workspace: https://github.com/nexu-io/open-design/actions/runs/38058101714/job/114233713360
+Required gate result: success
+
+CI tested synthetic merge commit 529f0b7958ae44c825e281ec4714bfcd0bede5f8.
+Verified parents (GitHub commit API):
+- main: 17e255959703a3fad7c8eb7f7b70dcafccc5629a
+- PR head: fb9becfa3cf61006c6e201d792df497748e79d60
+
+Actual web shard 1 log excerpts:
+2026-10-10T14:06:08.3730908Z  ✓ tests/components/ProjectView.reattach-restore.test.tsx (60 tests) 4234ms
+2026-10-10T14:07:52.0818127Z  ✓ tests/components/ProjectView.failed-artifact-delivery.test.tsx (7 tests) 425ms
+2026-10-10T14:10:27.0472641Z  ✓ tests/components/ChatPane.failed-artifact-delivery.test.tsx (3 tests) 195ms
+2026-10-10T14:11:39.8166408Z  Test Files  633 passed (633)
+2026-10-10T14:11:39.8206455Z       Tests  6447 passed | 4 skipped (6451)
+
+Actual web shard 2 log excerpts:
+2026-10-10T14:06:58.9941575Z  ✓ tests/components/chat/turn-boundary-spacing.test.tsx (9 tests) 11724ms
+2026-10-10T14:08:43.6030949Z  ✓ tests/components/ProjectView.reattach-retry-storm.test.tsx (3 tests) 2427ms
+2026-10-10T14:12:41.8539860Z  Test Files  633 passed (633)
+2026-10-10T14:12:41.8593626Z       Tests  6547 passed | 1 expected fail | 7 skipped (6555)
+
+All CI job conclusions:
+Resolve runner profiles: success
+Plan validation workloads: success
+Workspace unit tests: success
+E2E Vitest: success
+[build] packages/platform: success
+Daemon tests (1/4): success
+Web workspace tests (1/2): success
+Static gate: success
+Playwright visual (settings-workspace): success
+Preflight: success
+Daemon tests (3/4): success
+[test] packages/platform: success
+Playwright visual (entry-navigation): success
+Daemon tests (2/4): success
+Daemon tests (4/4): success
+UI P0 (project-collab): success
+UI P0 (project-runtime): success
+UI P0 (entry-settings): success
+UI P0 (project-workspace): success
+UI P0 (project-workspace-editor): success
+UI P0 (workspace-restoration): success
+Web workspace tests (2/2): success
+Windows tools-pack payload tests: skipped
+Playwright critical (${{ matrix.group }}): skipped
+Merge policy: skipped
+Validate workspace: success
+Runtime summary: success
+[cache] Isolated successful CI results: skipped
+[validate] Restored platform package: skipped
+
+Local red/green receipt:
+https://raw.githubusercontent.com/PratikRai0101/open-design/010b12e722d60ae8275a460e064d347b2ae8b71f/canceled-recovery-verification.txt
+
+Manual QA/design acceptance and code review remain separate human gates.
