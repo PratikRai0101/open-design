@@ -4,7 +4,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ProjectView } from '../../src/components/ProjectView';
-import { fetchChatRunStatus, streamViaDaemon, type DaemonStreamOptions } from '../../src/providers/daemon';
+import { fetchChatRunStatus, reattachDaemonRun, streamViaDaemon, type DaemonStreamOptions } from '../../src/providers/daemon';
 import { I18nProvider } from '../../src/i18n';
 import { listMessages, saveMessage } from '../../src/state/projects';
 import type { AppConfig, ChatMessage, Project, ProjectFile } from '../../src/types';
@@ -188,30 +188,39 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe('issue #8596: produced artifacts on a failed no-prose run', () => {
-  it.each([false, true])('recovers failed-run artifacts on reopen (strategy task: %s)', async (withStrategyTask) => {
+describe('issue #8596: produced artifacts on a terminal no-prose run', () => {
+  it.each([
+    { runStatus: 'failed', withStrategyTask: false },
+    { runStatus: 'failed', withStrategyTask: true },
+    { runStatus: 'canceled', withStrategyTask: false },
+    { runStatus: 'canceled', withStrategyTask: true },
+  ] as const)('recovers $runStatus-run artifacts on reopen (strategy task: $withStrategyTask)', async ({ runStatus, withStrategyTask }) => {
     const artifact: ProjectFile = { ...projectFile('image-result.png'), kind: 'image', mime: 'image/png' };
     files = [...files, artifact, projectFile('unrelated-later-file.html')];
     const message = {
       id: 'assistant-reopened', role: 'assistant', content: '', createdAt: 1000,
-      startedAt: 1000, endedAt: 2000, runId: 'run-reopened', runStatus: 'failed',
+      startedAt: 1000, endedAt: 2000, runId: 'run-reopened', runStatus,
       agentId: 'deepseek-harness', preTurnFileNames: ['input.md'],
-      events: [{ kind: 'status', label: 'error', code: 'AGENT_EXECUTION_FAILED',
-        failureCategory: 'empty_output', failureDetail: 'empty_output' }],
+      events: runStatus === 'failed'
+        ? [{ kind: 'status', label: 'error', code: 'AGENT_EXECUTION_FAILED',
+          failureCategory: 'empty_output', failureDetail: 'empty_output' }]
+        : [{ kind: 'status', label: 'canceled' }],
     } as ChatMessage;
     persisted.set(message.id, message);
     vi.mocked(fetchChatRunStatus).mockResolvedValue({
       id: message.runId!, assistantMessageId: message.id,
-      status: 'failed', agentId: 'deepseek-harness',
+      status: runStatus, agentId: 'deepseek-harness',
       createdAt: 1000, updatedAt: 2000, terminalAt: 2000,
       artifactCount: 1, artifactPaths: [artifact.name],
-      failureCategory: 'empty_output', failureDetail: 'empty_output',
+      ...(runStatus === 'failed' ? {
+        failureCategory: 'empty_output', failureDetail: 'empty_output',
+      } : {}),
       projectId: project.id, conversationId: `conv-${project.id}`,
       ...(withStrategyTask ? { strategyTask: {
         taskExecutionId: 'task-reopened',
         strategy: { id: 'od-next-strategy', version: '2.0.0',
           packageHash: 'b'.repeat(64), snapshotId: 'snapshot-reopened' },
-        inputStage: 'production', outcome: 'blocked', route: 'direct_edit',
+        inputStage: 'production', outcome: runStatus === 'failed' ? 'blocked' : 'canceled', route: 'direct_edit',
         executionMode: 'simple', activeRunId: message.runId!, terminal: true,
       } as const } : {}),
     });
@@ -234,8 +243,33 @@ describe('issue #8596: produced artifacts on a failed no-prose run', () => {
     await act(async () => { pendingReads.shift()!(); });
     await waitFor(() => expect(persisted.get(message.id)?.producedFiles?.map((file) => file.name))
       .toEqual([artifact.name]));
-    expect(persisted.get(message.id)?.runStatus).toBe('failed');
+    expect(persisted.get(message.id)?.runStatus).toBe(runStatus);
+    expect(persisted.get(message.id)?.endedAt).toBe(message.endedAt);
     expect(persisted.get(message.id)?.events).toEqual(message.events);
+    expect(reattachDaemonRun).not.toHaveBeenCalled();
+  });
+
+  it.each(['running', 'succeeded'] as const)('does not replay a canceled message when the daemon still reports %s', async (status) => {
+    const message = {
+      id: 'assistant-stopped', role: 'assistant', content: '', createdAt: 1000,
+      startedAt: 1000, endedAt: 2000, runId: 'run-stopped', runStatus: 'canceled',
+      agentId: 'deepseek-harness',
+      events: [{ kind: 'status', label: 'canceled' }],
+    } as ChatMessage;
+    persisted.set(message.id, message);
+    let resolveStatus!: (value: NonNullable<Awaited<ReturnType<typeof fetchChatRunStatus>>>) => void;
+    vi.mocked(fetchChatRunStatus).mockReturnValue(new Promise((resolve) => { resolveStatus = resolve; }));
+    mountProject();
+    await waitFor(() => expect(fetchChatRunStatus).toHaveBeenCalledWith(message.runId, null));
+    await act(async () => resolveStatus({
+      id: message.runId!, assistantMessageId: message.id,
+      status, agentId: 'deepseek-harness', createdAt: 1000, updatedAt: 2000,
+      artifactCount: 0, projectId: project.id, conversationId: `conv-${project.id}`,
+    }));
+    expect(persisted.get(message.id)?.runStatus).toBe('canceled');
+    expect(persisted.get(message.id)?.endedAt).toBe(message.endedAt);
+    expect(persisted.get(message.id)?.events).toEqual(message.events);
+    expect(reattachDaemonRun).not.toHaveBeenCalled();
   });
 
   it('attributes and persists the artifact delivered in the terminal frame', async () => {
