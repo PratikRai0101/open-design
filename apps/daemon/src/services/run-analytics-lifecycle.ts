@@ -22,6 +22,7 @@ import {
   odNextBlockedAnalyticsFromStrategyTask,
   modelIdForTracking,
   sessionModeToTracking,
+  savedCommentIds,
   type RunTaskLineageProps,
   type TrackingDesignSystemEditSurface,
   type TrackingDesignSystemKind,
@@ -596,7 +597,18 @@ export function createRunAnalyticsLifecycle(
                 ? 'mark'
                 : 'chat'
             : undefined;
+        // A same-Run recovery snapshot is authoritative, including an explicit
+        // empty list. Source-run lineage must never supply comment identities.
+        // ChatRun exposes only recovery context; the durable record also holds
+        // the plain event properties written by this lifecycle.
+        const recoveredCommentIds = (run.analyticsRecovery as
+          | { properties?: Record<string, unknown> }
+          | undefined)?.properties?.comment_ids;
+        const commentIds = Array.isArray(recoveredCommentIds)
+          ? [...recoveredCommentIds]
+          : savedCommentIds(reqBody.commentAttachments);
         const baseProps: Record<string, unknown> = {
+          ...(commentIds !== undefined ? { comment_ids: commentIds } : {}),
           page_name: isDesignSystemRun ? 'design_system_project' : 'chat_panel',
           area: isDesignSystemRun ? 'design_system_generation' : 'chat_composer',
           ...configureGlobals,
@@ -999,6 +1011,8 @@ export function createRunAnalyticsLifecycle(
               // terminal projection, the same object the SSE `end` payload and
               // the failure card were built from, so the three cannot drift.
               ...odNextBlockedAnalyticsFromStrategyTask(run.strategyTask),
+              ...(run.strategyTask?.settlementReason ? { od_next_settlement_reason: run.strategyTask.settlementReason } : {}),
+              ...(run.strategyTask?.settlementFacts ? { od_next_settlement_facts: run.strategyTask.settlementFacts } : {}),
               design_system_id: run.designSystemId ?? undefined,
               design_system_digest: run.designSystemDigest ?? undefined,
               design_system_selection_source: run.designSystemSelectionSource ?? 'none',

@@ -123,6 +123,7 @@ interface Props {
   skillsLoading?: boolean;
   designSystemsLoading?: boolean;
   projectsLoading?: boolean;
+  projectsLoadFailed?: boolean;
   promptTemplatesLoading?: boolean;
   onCreateProject: (input: EntryCreateProjectInput) => Promise<boolean> | boolean | void;
   /** Forwarded to EntryShell — see the prop docs there. */
@@ -294,6 +295,7 @@ export function EntryView({
   skillsLoading = false,
   designSystemsLoading = false,
   projectsLoading = false,
+  projectsLoadFailed = false,
   promptTemplatesLoading: _promptTemplatesLoading = false,
   onCreateProject,
   onBeginProjectCreation,
@@ -403,6 +405,7 @@ export function EntryView({
       skillsLoading={skillsLoading}
       designSystemsLoading={designSystemsLoading}
       projectsLoading={projectsLoading}
+      projectsLoadFailed={projectsLoadFailed}
       config={config}
       providerModelsCache={providerModelsCache}
       onProviderModelsCacheChange={onProviderModelsCacheChange}
