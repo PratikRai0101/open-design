@@ -518,7 +518,10 @@ describe('passive Cloud reauth cancel with workspace credential failure', () => 
             headers: { 'Content-Type': 'application/json' } });
         }
         if (url.includes('/api/integrations/vela/status')) {
-          if (options.vela === 'unresolved') return new Promise<Response>(() => {});
+          if (options.vela === 'unresolved') {
+            return new Response('{"message":"unresolved"}', { status: 503,
+              headers: { 'Content-Type': 'application/json' } });
+          }
           return new Response(JSON.stringify({
             loggedIn: true, sessionState: 'active', profile: 'prod',
             user: { id: 'u', email: 'user@example.com' }, configPath: '/x',

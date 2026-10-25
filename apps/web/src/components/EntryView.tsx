@@ -100,7 +100,8 @@ interface Props {
   composioConfigLoading?: boolean;
   daemonLive: boolean;
   onModeChange: (mode: ExecMode) => void;
-  onAgentChange: (id: string, source?: 'user' | 'auto') => void;
+  onAgentChange: (id: string) => void;
+  onUserAgentChange?: (id: string) => void;
   onAgentModelChange: (
     id: string,
     choice: { model?: string; reasoning?: string; serviceTier?: string },
@@ -284,6 +285,7 @@ export function EntryView({
   daemonLive,
   onModeChange,
   onAgentChange,
+  onUserAgentChange,
   onAgentModelChange,
   onApiProtocolChange,
   onApiModelChange,
@@ -420,6 +422,7 @@ export function EntryView({
       daemonLive={daemonLive}
       onModeChange={onModeChange}
       onAgentChange={onAgentChange}
+      onUserAgentChange={onUserAgentChange}
       onAgentModelChange={onAgentModelChange}
       onApiProtocolChange={onApiProtocolChange}
       onApiModelChange={onApiModelChange}

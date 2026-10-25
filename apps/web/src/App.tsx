@@ -3085,10 +3085,7 @@ function AppInner() {
   );
 
   const handleAgentChange = useCallback(
-    (agentId: string, source: 'user' | 'auto' = 'auto') => {
-      // Only an explicit user selection of the Cloud agent re-arms the gate.
-      // Automatic default selection also routes through this callback.
-      if (clearsCloudGateDismissal(agentId, source)) setCloudGateDismissed(false);
+    (agentId: string) => {
       const next = { ...latestPersistedConfigRef.current, agentId };
       latestPersistedConfigRef.current = next;
       saveConfig(next);
@@ -3097,6 +3094,13 @@ function AppInner() {
     },
     [],
   );
+
+  // Explicit user picks come through a separate callback so automatic default
+  // selection cannot clear the cancellation dismissal.
+  const handleUserAgentChange = useCallback((agentId: string) => {
+    // Selection persistence stays in onAgentChange; this only re-arms the gate.
+    if (clearsCloudGateDismissal(agentId, 'user')) setCloudGateDismissed(false);
+  }, []);
 
   // OPEND-3205: this action changes the runtime in the current project. Do not
   // optimistically acknowledge a daemon write or arm a Settings-return retry.
@@ -6004,6 +6008,7 @@ function AppInner() {
         daemonLive={daemonLive}
         onModeChange={handleModeChange}
         onAgentChange={handleAgentChange}
+        onUserAgentChange={handleUserAgentChange}
         onAgentModelChange={handleAgentModelChange}
         onApiProtocolChange={handleApiProtocolChange}
         onApiModelChange={handleApiModelChange}
