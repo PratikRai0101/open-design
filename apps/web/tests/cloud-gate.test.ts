@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
-import { cloudGateDecision, isCloudAgentUsableForAutoPick } from '../src/cloud-gate';
+import {
+  clearsCloudGateDismissal,
+  cloudGateDecision,
+  isCloudAgentUsableForAutoPick,
+} from '../src/cloud-gate';
 
 describe('cloudGateDecision', () => {
   const base = {
@@ -48,5 +52,14 @@ describe('isCloudAgentUsableForAutoPick', () => {
   it('accepts an authenticated session and an unresolved status', () => {
     expect(isCloudAgentUsableForAutoPick({ loggedIn: true, sessionState: 'active' })).toBe(true);
     expect(isCloudAgentUsableForAutoPick(null)).toBe(true);
+  });
+});
+
+describe('clearsCloudGateDismissal', () => {
+  it('only clears for a deliberate user Cloud selection', () => {
+    expect(clearsCloudGateDismissal('amr', 'user')).toBe(true);
+    expect(clearsCloudGateDismissal('amr', 'auto')).toBe(false);
+    expect(clearsCloudGateDismissal('amr')).toBe(false);
+    expect(clearsCloudGateDismissal('claude', 'user')).toBe(false);
   });
 });

@@ -516,7 +516,7 @@ interface Props {
   amrAccountId?: string | null;
   daemonLive: boolean;
   onModeChange: (mode: ExecMode) => void;
-  onAgentChange: (id: string) => void;
+  onAgentChange: (id: string, source?: 'user' | 'auto') => void;
   onAgentModelChange: (
     id: string,
     choice: { model?: string; reasoning?: string; serviceTier?: string },
@@ -2335,7 +2335,7 @@ function OnboardingView({
   agentsLoading?: boolean;
   daemonLive: boolean;
   onModeChange: (mode: ExecMode) => void;
-  onAgentChange: (id: string) => void;
+  onAgentChange: (id: string, source?: 'user' | 'auto') => void;
   onAgentModelChange: (
     id: string,
     choice: { model?: string; reasoning?: string; serviceTier?: string },

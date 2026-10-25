@@ -107,7 +107,7 @@ interface Props {
   compact?: boolean;
   daemonLive: boolean;
   onModeChange: (mode: ExecMode) => void;
-  onAgentChange: (id: string) => void;
+  onAgentChange: (id: string, source?: 'user' | 'auto') => void;
   onAgentModelChange: (
     id: string,
     choice: { model?: string; reasoning?: string; serviceTier?: string },
@@ -530,7 +530,7 @@ export function InlineModelSwitcher({
         element: 'agent_card',
         cli_provider_id: agentIdToTracking(agentId),
       });
-      onAgentChange?.(agentId);
+      onAgentChange?.(agentId, 'user');
       if (agentId !== 'amr') return;
       if (amrLoginPending) {
         await handleAmrCancelLogin();

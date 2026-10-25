@@ -36,3 +36,14 @@ export function isCloudAgentUsableForAutoPick(status: CloudAuthStatus): boolean 
   if (status.sessionState === 'reauth_required') return false;
   return true;
 }
+
+/**
+ * Only a deliberate user pick of the Cloud agent re-arms the gate. Automatic
+ * default selection also flows through onAgentChange, so the source matters.
+ */
+export function clearsCloudGateDismissal(
+  agentId: string,
+  source: 'user' | 'auto' = 'auto',
+): boolean {
+  return agentId === 'amr' && source === 'user';
+}

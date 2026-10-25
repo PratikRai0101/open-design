@@ -32,7 +32,36 @@ import { listProjects, listTemplates } from '../../src/state/projects';
 import { I18nProvider, useI18n } from '../../src/i18n';
 import { clearTestRuntimeSession, observeTestRuntimeIdentity, useTestRuntime } from '../../src/components/TestCampaignModal';
 
+import {
+  workspaceContextFixture,
+  workspaceDirectoryFixture,
+} from '../helpers/workspace-context';
+
 const analyticsMocks = vi.hoisted(() => ({ track: vi.fn() }));
+const workspaceOverride = vi.hoisted(() => ({
+  value: null as null | Record<string, unknown>,
+}));
+vi.mock('../../src/collab/useWorkspaceContext', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/collab/useWorkspaceContext')>();
+  let cachedReal: unknown = null;
+  let cachedOverride: unknown = null;
+  let cachedMerged: unknown = null;
+  return {
+    ...actual,
+    useWorkspaceContext: () => {
+      const real = actual.useWorkspaceContext();
+      const override = workspaceOverride.value;
+      if (!override) return real;
+      if (real !== cachedReal || override !== cachedOverride) {
+        cachedReal = real;
+        cachedOverride = override;
+        cachedMerged = { ...(real as object), ...override };
+      }
+      return cachedMerged;
+    },
+  };
+});
+
 const cmsTestMocks = vi.hoisted(() => ({ realCoordinator: false }));
 
 // App owns route eligibility; the host suites separately exercise authorization,
@@ -268,6 +297,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  workspaceOverride.value = null;
   clearTestRuntimeSession();
   vi.unstubAllGlobals();
   vi.clearAllMocks();
@@ -469,6 +499,101 @@ describe('passive Cloud reauth cancel (end to end)', () => {
     expect(lastSynced?.onboardingCompleted).toBe(true);
     expect(vi.mocked(saveConfig)).toHaveBeenCalled();
   });
+});
+
+describe('passive Cloud reauth cancel with workspace credential failure', () => {
+  function stubFetch(options: { vela: 'authenticated' | 'unresolved' }) {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === '/api/workspace/directory') {
+          return new Response(JSON.stringify(workspaceDirectoryFixture([
+            workspaceContextFixture({ workspaceId: 'ws-reauth', workspaceMemberId: 'wm-reauth',
+              workspaceName: 'Reauth Workspace' }),
+          ])), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }
+        if (url.includes('/api/workspace/context')) {
+          return new Response('{"message":"reauth"}', { status: 401,
+            headers: { 'Content-Type': 'application/json' } });
+        }
+        if (url.includes('/api/integrations/vela/status')) {
+          if (options.vela === 'unresolved') return new Promise<Response>(() => {});
+          return new Response(JSON.stringify({
+            loggedIn: true, sessionState: 'active', profile: 'prod',
+            user: { id: 'u', email: 'user@example.com' }, configPath: '/x',
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }
+        return new Response('{}', { status: 200,
+          headers: { 'Content-Type': 'application/json' } });
+      }),
+    );
+  }
+
+  async function cancelFromWorkspaceGate() {
+    render(<App />);
+    await screen.findByRole(
+      'button', { name: /Cancel and return to OpenDesign/i }, { timeout: 10000 },
+    );
+    // Re-query on every attempt: AMR status polling can replace the button
+    // between the find and the click.
+    await waitFor(() => {
+      fireEvent.click(screen.getByRole('button', { name: /Cancel and return to OpenDesign/i }));
+      expect(window.location.pathname).toBe('/');
+    }, { timeout: 10000 });
+  }
+
+  it('keeps the dismissal when no local agent exists and AMR looks authenticated', async () => {
+    workspaceOverride.value = {
+      context: null, loading: false, failure: 'reauth-required',
+      identityChangePending: false, resourceReadIdentity: null,
+    };
+    window.history.replaceState(null, '', '/');
+    mockedLoadConfig.mockReturnValue({
+      ...firstRunConfig(), agentId: 'amr', onboardingCompleted: true,
+    });
+    mockedFetchDaemonConfig.mockResolvedValue({ agentId: 'amr', onboardingCompleted: true });
+    // No usable local agent: AMR is the only candidate the fallback could pick.
+    mockedFetchAgentsStream.mockReset();
+    mockedFetchAgentsStream.mockResolvedValue([{ ...amrAgent }]);
+    stubFetch({ vela: 'authenticated' });
+
+    await cancelFromWorkspaceGate();
+
+    // Cancellation survives a later render/focus without selecting AMR.
+    await act(async () => {
+      window.dispatchEvent(new Event('focus'));
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(window.location.pathname).toBe('/'));
+    expect(screen.queryByRole('heading', { name: 'Welcome to OpenDesign' })).toBeNull();
+    const lastSynced = vi.mocked(syncConfigToDaemon).mock.calls.at(-1)?.[0] as AppConfig | undefined;
+    expect(lastSynced?.agentId).toBeNull();
+    expect(lastSynced?.onboardingCompleted).toBe(true);
+    expect(lastSynced?.agentId).not.toBe('amr');
+  }, 20000);
+
+  it('keeps the dismissal when AMR login status is unresolved', async () => {
+    workspaceOverride.value = {
+      context: null, loading: false, failure: 'reauth-required',
+      identityChangePending: false, resourceReadIdentity: null,
+    };
+    window.history.replaceState(null, '', '/');
+    mockedLoadConfig.mockReturnValue({
+      ...firstRunConfig(), agentId: 'amr', onboardingCompleted: true,
+    });
+    mockedFetchDaemonConfig.mockResolvedValue({ agentId: 'amr', onboardingCompleted: true });
+    mockedFetchAgentsStream.mockReset();
+    mockedFetchAgentsStream.mockResolvedValue([{ ...amrAgent }]);
+    stubFetch({ vela: 'unresolved' });
+
+    await cancelFromWorkspaceGate();
+
+    await act(async () => { await Promise.resolve(); });
+    expect(window.location.pathname).toBe('/');
+    const lastSynced = vi.mocked(syncConfigToDaemon).mock.calls.at(-1)?.[0] as AppConfig | undefined;
+    expect(lastSynced?.agentId).toBeNull();
+  }, 20000);
 });
 
 describe('onboarding -> home AMR selection (end to end)', () => {

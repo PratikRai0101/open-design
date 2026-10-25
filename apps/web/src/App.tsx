@@ -132,7 +132,7 @@ import {
   isAmrSessionAuthenticated,
 } from './components/amrLoginPolling';
 import { CollabDemoView } from './collab/CollabDemoView';
-import { cloudGateDecision, isCloudAgentUsableForAutoPick } from './cloud-gate';
+import { clearsCloudGateDismissal, cloudGateDecision, isCloudAgentUsableForAutoPick } from './cloud-gate';
 import {
   WorkspaceMemberDirectoryPreloader,
 } from './collab/WorkspaceMemberDirectoryPreloader';
@@ -2298,6 +2298,7 @@ function AppInner() {
     config.mode,
     route,
     workspaceContextState.failure,
+    cloudGateDismissed,
   ]);
 
   // Bootstrap — detect daemon, then fan out independent fetches so each
@@ -2620,10 +2621,14 @@ function AppInner() {
     if (!daemonConfigLoaded || agentsLoading) return;
     if (config.onboardingCompleted !== true) return;
     if (config.agentId) return;
-    // A signed-out or expired Cloud agent is not a usable auto-pick: selecting
-    // it would immediately recreate the passive reauth gate (issue #8370).
-    // Expired sessions keep loggedIn=true, so sessionState matters too.
-    const cloudUnavailable = !isCloudAgentUsableForAutoPick(amrLoginStatus);
+    // A signed-out, expired, or unresolved Cloud agent is not a usable
+    // auto-pick: selecting it recreates the passive reauth gate (#8370). While
+    // workspace credentials are being rejected, AMR must stay unselected so a
+    // cancel dismissal is not undone by an automatic pick.
+    const cloudUnavailable =
+      workspaceContextState.failure === 'reauth-required'
+      || amrLoginStatus === null
+      || !isCloudAgentUsableForAutoPick(amrLoginStatus);
     const firstAvailable = agents.find(
       (a) => a.available && (!cloudUnavailable || a.id !== AMR_AGENT_ID),
     );
@@ -2639,8 +2644,8 @@ function AppInner() {
     daemonConfigLoaded,
     agentsLoading,
     agents,
-    amrLoginStatus?.loggedIn,
-    amrLoginStatus?.sessionState,
+    amrLoginStatus,
+    workspaceContextState.failure,
     config.agentId,
     config.onboardingCompleted,
   ]);
@@ -3080,7 +3085,10 @@ function AppInner() {
   );
 
   const handleAgentChange = useCallback(
-    (agentId: string) => {
+    (agentId: string, source: 'user' | 'auto' = 'auto') => {
+      // Only an explicit user selection of the Cloud agent re-arms the gate.
+      // Automatic default selection also routes through this callback.
+      if (clearsCloudGateDismissal(agentId, source)) setCloudGateDismissed(false);
       const next = { ...latestPersistedConfigRef.current, agentId };
       latestPersistedConfigRef.current = next;
       saveConfig(next);
@@ -3093,6 +3101,7 @@ function AppInner() {
   // OPEND-3205: this action changes the runtime in the current project. Do not
   // optimistically acknowledge a daemon write or arm a Settings-return retry.
   const handleSwitchToCloud = useCallback(async () => {
+    setCloudGateDismissed(false);
     const previous = latestPersistedConfigRef.current;
     const issuedAccount = currentWorkspaceAccountGeneration();
     const issuedIdentity = workspaceIdentityCacheKey(workspaceContextRef.current);
@@ -5349,12 +5358,6 @@ function AppInner() {
   useEffect(() => {
     if (workspaceContextState.failure !== 'reauth-required') setCloudGateDismissed(false);
   }, [workspaceContextState.failure]);
-
-  useEffect(() => {
-    if (config.mode === 'daemon' && config.agentId === AMR_AGENT_ID) {
-      setCloudGateDismissed(false);
-    }
-  }, [config.mode, config.agentId]);
 
   const handleCancelCloudOnboarding = useCallback(() => {
     setCloudGateDismissed(true);
