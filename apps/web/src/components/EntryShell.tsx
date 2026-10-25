@@ -103,6 +103,7 @@ import {
   RailAccountRecoveryTip,
   RailAccountSyncTip,
 } from './CloudSignInTip';
+import { cloudGateDecision } from '../cloud-gate';
 import {
   resolveEntryRailAccountFooterState,
   requiresAmrReauthentication,
@@ -588,6 +589,7 @@ interface Props {
    * Connect stays a required step.
    */
   onCancelCloudOnboarding?: () => void;
+  cloudGateDismissed?: boolean;
   onSignedOut?: () => void | Promise<void>;
   onAmrLoginStatusChange?: (status: VelaLoginStatus | null) => void;
   artifactUpgradeSlot?: ReactNode;
@@ -698,6 +700,7 @@ export function EntryShell({
   onOpenSettings,
   onCompleteOnboarding,
   onCancelCloudOnboarding,
+  cloudGateDismissed = false,
   onSignedOut,
   onAmrLoginStatusChange,
   artifactUpgradeSlot,
@@ -736,12 +739,20 @@ export function EntryShell({
   useEffect(() => {
     // The entry shell is an authenticated surface. Both an explicit signed-out
     // status and a definitive credential rejection return to the existing
-    // Cloud identity gate. Passive reauthentication preserves the saved model
-    // source and Home's locally persisted, not-yet-sent draft.
-    const selectedCloudIdentityRejected = usesOpenDesignCloud && amrLoggedIn === false;
-    if ((!selectedCloudIdentityRejected && !amrAuthRequired) || view === 'onboarding') return;
+    // Cloud identity gate. A completed user who cancelled the passive gate is
+    // left on Home while amrAuthRequired keeps workspace/Cloud writes blocked.
+    const redirectRequired = cloudGateDecision({
+      usesOpenDesignCloud,
+      amrLoggedIn: amrLoggedIn ?? undefined,
+      amrSessionState: requiresAmrReauthentication(amrSessionState, undefined)
+        ? 'reauth_required' : null,
+      workspaceFailure: workspaceContextState.failure,
+      dismissed: cloudGateDismissed,
+    });
+    if (!redirectRequired || view === 'onboarding') return;
     navigate({ kind: 'home', view: 'onboarding' }, { replace: true });
-  }, [amrAuthRequired, amrLoggedIn, usesOpenDesignCloud, view]);
+  }, [amrLoggedIn, amrSessionState, cloudGateDismissed, usesOpenDesignCloud, view,
+      workspaceContextState.failure]);
   let accountFooterNotice: ReactNode = null;
   if (accountFooterState === 'syncing') {
     accountFooterNotice = <RailAccountSyncTip />;
