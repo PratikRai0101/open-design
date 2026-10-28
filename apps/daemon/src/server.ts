@@ -14021,9 +14021,15 @@ export async function startServer({
     // budgeting the prompt alone would have let the reported run through.
     // Ask each configured server for its `tools/list` payload first.
     if (byokOpenCodeProvider) {
-      const toolSchemaMeasurement = await measureOpenCodeMcpToolSchemaBytes(
-        opencodeConfigContent,
-      );
+      // `opencodeConfigContent` is only the daemon's layer. OpenCode keeps the
+      // user's global `~/.config/opencode/opencode.json[c]` active underneath
+      // it, and in #9118 the 462,317-byte server lived in exactly that file —
+      // so the budget has to cover the merged set, resolved against the env the
+      // child will actually spawn with.
+      const toolSchemaMeasurement = await measureOpenCodeMcpToolSchemaBytes({
+        overlayContent: opencodeConfigContent,
+        env: { ...process.env, ...(def.env || {}), ...configuredAgentEnv },
+      });
       if (toolSchemaMeasurement.unmeasuredServerIds.length > 0) {
         // The budget below cannot see these servers' tool schemas, so it
         // cannot clear them either. Name the blind spot rather than let the

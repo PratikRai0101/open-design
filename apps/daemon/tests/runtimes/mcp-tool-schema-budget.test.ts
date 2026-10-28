@@ -1,11 +1,12 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   _resetMcpToolSchemaMeasurementCache,
   measureOpenCodeMcpToolSchemaBytes,
+  parseJsonc,
 } from '../../src/runtimes/mcp-tool-schema-budget.js';
 
 let workDir: string;
@@ -13,17 +14,13 @@ let serverScript: string;
 
 // Same shape as the config the daemon hands OpenCode via
 // OPENCODE_CONFIG_CONTENT: `mcp[id] = { type, command[], enabled }`.
-function localServerConfig(script: string, overrides: Record<string, unknown> = {}) {
-  return JSON.stringify({
-    mcp: {
-      'fake-server': {
-        type: 'local',
-        command: [process.execPath, script],
-        enabled: true,
-        ...overrides,
-      },
-    },
-  });
+function localServerEntry(script: string, overrides: Record<string, unknown> = {}) {
+  return {
+    type: 'local',
+    command: [process.execPath, script],
+    enabled: true,
+    ...overrides,
+  };
 }
 
 beforeAll(async () => {
@@ -61,10 +58,53 @@ afterAll(async () => {
   await rm(workDir, { recursive: true, force: true });
 });
 
+beforeEach(() => {
+  _resetMcpToolSchemaMeasurementCache();
+});
+
+// `env` points HOME/XDG at an empty scratch dir unless a test supplies its own,
+// so the developer's real ~/.config/opencode never leaks into a measurement.
+type ScratchEnv = { HOME: string; XDG_CONFIG_HOME: string };
+
+async function scratchEnv(): Promise<ScratchEnv> {
+  const home = await mkdtemp(join(tmpdir(), 'od-mcp-home-'));
+  return { HOME: home, XDG_CONFIG_HOME: join(home, '.config') };
+}
+
+async function writeGlobalConfig(
+  env: ScratchEnv,
+  fileName: string,
+  contents: string,
+): Promise<string> {
+  const dir = join(env.XDG_CONFIG_HOME, 'opencode');
+  await mkdir(dir, { recursive: true });
+  const file = join(dir, fileName);
+  await writeFile(file, contents, 'utf8');
+  return file;
+}
+
+describe('parseJsonc', () => {
+  it('strips comments and trailing commas without touching strings', () => {
+    const parsed = parseJsonc(`{
+      // a line comment
+      "url": "https://example.test//not-a-comment",
+      /* a block comment */
+      "list": [1, 2, ],
+    }`);
+
+    expect(parsed).toEqual({
+      url: 'https://example.test//not-a-comment',
+      list: [1, 2],
+    });
+  });
+});
+
 describe('measureOpenCodeMcpToolSchemaBytes', () => {
-  it('measures nothing when the OpenCode config declares no MCP servers', async () => {
-    for (const config of [null, undefined, '', 'not json', '{}', '{"mcp":{}}']) {
-      expect(await measureOpenCodeMcpToolSchemaBytes(config)).toEqual({
+  it('measures nothing when neither config layer declares MCP servers', async () => {
+    const env = await scratchEnv();
+    for (const overlayContent of [null, undefined, '', 'not json', '{}', '{"mcp":{}}']) {
+      const measurement = await measureOpenCodeMcpToolSchemaBytes({ overlayContent, env });
+      expect(measurement).toMatchObject({
         bytes: 0,
         toolCount: 0,
         measured: [],
@@ -74,45 +114,116 @@ describe('measureOpenCodeMcpToolSchemaBytes', () => {
   });
 
   it('sums the tool definitions OpenCode would re-send on every request', async () => {
-    _resetMcpToolSchemaMeasurementCache();
-    const measurement = await measureOpenCodeMcpToolSchemaBytes(localServerConfig(serverScript));
+    const env = await scratchEnv();
+    const measurement = await measureOpenCodeMcpToolSchemaBytes({
+      overlayContent: JSON.stringify({
+        mcp: { 'fake-server': localServerEntry(serverScript) },
+      }),
+      env,
+    });
 
     expect(measurement.unmeasuredServerIds).toEqual([]);
     expect(measurement.toolCount).toBe(2);
     expect(measurement.measured).toEqual([
       { serverId: 'fake-server', bytes: expect.any(Number), toolCount: 2 },
     ]);
-    // Two small tools: measured, non-zero, and far below any context window.
     expect(measurement.bytes).toBeGreaterThan(0);
     expect(measurement.bytes).toBeLessThan(2_000);
+    expect(measurement.configSources).toEqual(['OPENCODE_CONFIG_CONTENT']);
   });
 
-  it('skips a disabled server instead of spawning it', async () => {
-    _resetMcpToolSchemaMeasurementCache();
-    const measurement = await measureOpenCodeMcpToolSchemaBytes(
-      localServerConfig(serverScript, { enabled: false }),
+  // Review on #9136, P1: `OPENCODE_CONFIG_CONTENT` is only the daemon's layer.
+  // #9118's 462,317-byte server lived in the user's global opencode.jsonc, so
+  // a measurement that only reads the overlay reports zero and lets the run
+  // start — the exact gap this test pins.
+  it('measures a server declared only in the global opencode.jsonc', async () => {
+    const env = await scratchEnv();
+    const globalFile = await writeGlobalConfig(
+      env,
+      'opencode.jsonc',
+      `{
+        // the oversized schema from #9118 lived in a file like this one
+        "mcp": {
+          "global-only": ${JSON.stringify(localServerEntry(serverScript))},
+        },
+      }`,
     );
 
-    expect(measurement).toEqual({
-      bytes: 0,
-      toolCount: 0,
-      measured: [],
-      unmeasuredServerIds: [],
+    const measurement = await measureOpenCodeMcpToolSchemaBytes({ overlayContent: null, env });
+
+    expect(measurement.measured.map((m) => m.serverId)).toEqual(['global-only']);
+    expect(measurement.toolCount).toBe(2);
+    expect(measurement.bytes).toBeGreaterThan(0);
+    expect(measurement.configSources).toEqual([globalFile]);
+  });
+
+  it('merges both layers and lets the daemon overlay win per server id', async () => {
+    const env = await scratchEnv();
+    await writeGlobalConfig(
+      env,
+      'opencode.json',
+      JSON.stringify({
+        mcp: {
+          shared: localServerEntry(serverScript),
+          'global-only': localServerEntry(serverScript),
+        },
+      }),
+    );
+
+    const measurement = await measureOpenCodeMcpToolSchemaBytes({
+      overlayContent: JSON.stringify({
+        // Same id as the global entry: one server, not two, and the daemon's
+        // descriptor is the one OpenCode runs.
+        mcp: { shared: localServerEntry(serverScript) },
+      }),
+      env,
     });
+
+    expect(measurement.measured.map((m) => m.serverId).sort()).toEqual([
+      'global-only',
+      'shared',
+    ]);
+    expect(measurement.toolCount).toBe(4);
+    expect(measurement.configSources).toHaveLength(2);
+  });
+
+  it('skips a disabled server from either layer instead of spawning it', async () => {
+    const env = await scratchEnv();
+    await writeGlobalConfig(
+      env,
+      'opencode.json',
+      JSON.stringify({ mcp: { off: localServerEntry(serverScript, { enabled: false }) } }),
+    );
+
+    expect(
+      await measureOpenCodeMcpToolSchemaBytes({
+        overlayContent: JSON.stringify({
+          mcp: { 'overlay-off': localServerEntry(serverScript, { enabled: false }) },
+        }),
+        env,
+      }),
+    ).toMatchObject({ bytes: 0, toolCount: 0, measured: [], unmeasuredServerIds: [] });
   });
 
   // An unreachable server is neither evidence that the run fits nor evidence
-  // that it doesn't. It must be reported, never silently counted as zero
-  // bytes of tool schema.
+  // that it doesn't. It must be reported, never silently counted as zero bytes
+  // of tool schema.
   it('reports an unreachable server as unmeasured rather than empty', async () => {
-    _resetMcpToolSchemaMeasurementCache();
+    const env = await scratchEnv();
     const measurement = await measureOpenCodeMcpToolSchemaBytes(
-      localServerConfig(serverScript, { command: [join(workDir, 'does-not-exist')] }),
+      {
+        overlayContent: JSON.stringify({
+          mcp: {
+            broken: localServerEntry(join(workDir, 'does-not-exist')),
+          },
+        }),
+        env,
+      },
       { serverTimeoutMs: 500, totalTimeoutMs: 1_000 },
     );
 
     expect(measurement.bytes).toBe(0);
     expect(measurement.toolCount).toBe(0);
-    expect(measurement.unmeasuredServerIds).toEqual(['fake-server']);
+    expect(measurement.unmeasuredServerIds).toEqual(['broken']);
   });
 });

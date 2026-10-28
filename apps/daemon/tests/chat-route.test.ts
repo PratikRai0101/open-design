@@ -1053,6 +1053,120 @@ process.stdin.on('end', () => {
     }
   });
 
+  // Review on #9136, P1 (round 2): the daemon's OPENCODE_CONFIG_CONTENT is
+  // only an overlay. OpenCode keeps the user's global
+  // ~/.config/opencode/opencode.json[c] active underneath it, and #9118's
+  // 462,317-byte server lived in exactly that file — so measuring the overlay
+  // alone reports zero and lets the reported run start.
+  it('refuses a BYOK OpenCode run whose oversized tool schema comes from the global opencode config', async () => {
+    if (!process.env.OD_DATA_DIR) {
+      throw new Error('OD_DATA_DIR is required for BYOK context budget tests');
+    }
+
+    const projectId = `proj-${randomUUID()}`;
+    const markerDir = await fsp.mkdtemp(join(tmpdir(), 'od-byok-global-schema-budget-'));
+    tempDirs.push(markerDir);
+    const spawnMarker = join(markerDir, 'opencode-spawned.txt');
+    const mcpServerPath = join(markerDir, 'global-schema-mcp.cjs');
+    const configHome = join(markerDir, 'xdg-config');
+    const globalConfigDir = join(configHome, 'opencode');
+
+    await fsp.writeFile(
+      mcpServerPath,
+      `
+const readline = require('node:readline');
+const BIG = 'a'.repeat(400000);
+const send = (msg) => process.stdout.write(JSON.stringify(msg) + '\\n');
+readline.createInterface({ input: process.stdin }).on('line', (line) => {
+  if (!line.trim()) return;
+  let msg;
+  try { msg = JSON.parse(line); } catch { return; }
+  if (msg.id === undefined) return;
+  if (msg.method === 'initialize') {
+    send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'global-schema', version: '1' } } });
+    return;
+  }
+  if (msg.method === 'tools/list') {
+    send({ jsonrpc: '2.0', id: msg.id, result: { tools: [{ name: 'global_oversized_tool', description: BIG, inputSchema: { type: 'object', properties: {} } }] } });
+    return;
+  }
+  send({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'unsupported' } });
+});
+`,
+      'utf8',
+    );
+
+    // A real OpenCode global config, JSONC and all: this is where #9118's
+    // oversized server was declared.
+    await fsp.mkdir(globalConfigDir, { recursive: true });
+    await fsp.writeFile(
+      join(globalConfigDir, 'opencode.jsonc'),
+      `{
+        // user-configured global MCP server
+        "mcp": {
+          "global-oversized": {
+            "type": "local",
+            "command": [${JSON.stringify(process.execPath)}, ${JSON.stringify(mcpServerPath)}],
+            "enabled": true,
+          },
+        },
+      }`,
+      'utf8',
+    );
+
+    const previousXdgConfigHome = process.env.XDG_CONFIG_HOME;
+    process.env.XDG_CONFIG_HOME = configHome;
+    try {
+      const createProjectResponse = await fetch(`${baseUrl}/api/projects`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: projectId, name: 'BYOK global schema fixture' }),
+      });
+      expect(createProjectResponse.ok).toBe(true);
+
+      await withFakeAgent(
+        'opencode',
+        `
+const fs = require('node:fs');
+fs.writeFileSync(${JSON.stringify(spawnMarker)}, 'spawned');
+process.stdin.resume();
+process.stdin.on('end', () => {
+  console.log(JSON.stringify({ type: 'text', part: { text: 'global-schema-ran' } }));
+  process.exit(0);
+});
+`,
+        async () => {
+          const response = await fetch(`${baseUrl}/api/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              agentId: 'byok-opencode',
+              projectId,
+              message: 'hello',
+              model: 'deepseek-v4-flash',
+              byokProvider: {
+                protocol: 'senseaudio',
+                apiKey: 'sk-test-byok',
+                baseUrl: 'https://api.senseaudio.cn',
+                model: 'deepseek-v4-flash',
+                requiresApiKey: true,
+              },
+            }),
+          });
+          const body = await response.text();
+
+          expect(body).toContain('AGENT_PROMPT_TOO_LARGE');
+          expect(body).toContain('tool schemas');
+          expect(body).not.toContain('global-schema-ran');
+          await expect(fsp.access(spawnMarker)).rejects.toThrow();
+        },
+      );
+    } finally {
+      if (previousXdgConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = previousXdgConfigHome;
+    }
+  });
+
   it('passes keyless BYOK provider config without auth fields to OpenCode', async () => {
     if (!process.env.OD_DATA_DIR) {
       throw new Error('OD_DATA_DIR is required for BYOK OpenCode config tests');
