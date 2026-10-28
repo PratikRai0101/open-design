@@ -268,6 +268,7 @@ import {
   BYOK_OPENCODE_PROVIDER_REQUIRED_MESSAGE,
 } from './runtimes/byok-opencode.js';
 import { checkStaticPromptContextBudget } from './runtimes/context-window-budget.js';
+import { measureOpenCodeMcpToolSchemaBytes } from './runtimes/mcp-tool-schema-budget.js';
 import {
   extractPlainStreamArtifacts,
   persistPlainStreamArtifactList,
@@ -14007,18 +14008,37 @@ export async function startServer({
     }
 
     // BYOK OpenCode is the one runtime whose context window this daemon
-    // declares rather than reads (see `byok-opencode.ts`). A prompt that
-    // is already over that declared window never recovers: OpenCode
-    // answers by compacting the conversation, compaction cannot shrink
-    // the static prompt, so it re-fires on the next step and keeps
+    // declares rather than reads (see `byok-opencode.ts`). A request that
+    // is already over that declared window never recovers: OpenCode answers
+    // by compacting the conversation, compaction cannot shrink content that
+    // is re-sent on every request, so it re-fires on the next step and keeps
     // charging the provider until something outside the daemon stops it
     // (issue #9118). Refuse the run before the agent binary is spawned.
+    //
+    // `composed` is only the daemon's text payload. OpenCode resolves the
+    // MCP tool schemas itself from `OPENCODE_CONFIG_CONTENT`, and in #9118
+    // those schemas alone were 462,317 bytes — larger than the window — so
+    // budgeting the prompt alone would have let the reported run through.
+    // Ask each configured server for its `tools/list` payload first.
     if (byokOpenCodeProvider) {
+      const toolSchemaMeasurement = await measureOpenCodeMcpToolSchemaBytes(
+        opencodeConfigContent,
+      );
+      if (toolSchemaMeasurement.unmeasuredServerIds.length > 0) {
+        // The budget below cannot see these servers' tool schemas, so it
+        // cannot clear them either. Name the blind spot rather than let the
+        // guard look like it covered them.
+        console.warn(
+          '[byok-context-budget] tool schemas unmeasured for MCP servers:',
+          toolSchemaMeasurement.unmeasuredServerIds.join(', '),
+        );
+      }
       const contextWindowError = checkStaticPromptContextBudget({
         agentName: def.name,
         model: byokOpenCodeProvider.modelId,
         promptBytes:
           typeof composed === 'string' ? Buffer.byteLength(composed, 'utf8') : 0,
+        toolSchemaBytes: toolSchemaMeasurement.bytes,
         contextWindowTokens: BYOK_OPENCODE_CONTEXT_TOKEN_LIMIT,
         outputTokenReserveTokens: BYOK_OPENCODE_OUTPUT_TOKEN_LIMIT,
       });

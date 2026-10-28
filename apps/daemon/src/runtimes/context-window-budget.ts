@@ -17,6 +17,14 @@ export interface StaticPromptContextBudgetInput {
   model: string;
   /** UTF-8 size of the composed prompt this run will send. */
   promptBytes: number;
+  /**
+   * UTF-8 size of the tool schemas the runtime resolves for this run and
+   * re-sends on every request. OpenCode builds these from the MCP servers
+   * it is configured with, after the daemon hands over the config, so they
+   * are not part of `promptBytes` (see #9118: 462,317 bytes of tool
+   * definitions dwarfed the prompt itself).
+   */
+  toolSchemaBytes?: number;
   /** Window the runtime declares for this model. */
   contextWindowTokens: number;
   /** Tokens that must stay free for the model's reply. */
@@ -26,6 +34,8 @@ export interface StaticPromptContextBudgetInput {
 export interface StaticPromptContextBudgetError extends RuntimePromptBudgetError {
   promptTokenEstimate: number;
   contextWindowTokens: number;
+  /** Tokens attributed to resolved tool schemas, when any were measured. */
+  toolSchemaTokenEstimate: number;
 }
 
 export function estimatePromptTokens(promptBytes: number): number {
@@ -59,20 +69,37 @@ export function checkStaticPromptContextBudget(
     ? Math.max(input.outputTokenReserveTokens, 0)
     : 0;
   const limit = contextWindowTokens - outputTokenReserveTokens;
+  const toolSchemaBytes = Number.isFinite(input.toolSchemaBytes)
+    ? Math.max(input.toolSchemaBytes ?? 0, 0)
+    : 0;
   const promptTokenEstimate = estimatePromptTokens(input.promptBytes);
-  if (promptTokenEstimate <= limit) return null;
+  const toolSchemaTokenEstimate = estimatePromptTokens(toolSchemaBytes);
+  const staticTokenEstimate = promptTokenEstimate + toolSchemaTokenEstimate;
+  if (staticTokenEstimate <= limit) return null;
+
+  // Name the part that is actually over budget. When tool schemas are what
+  // pushed the request past the window, advice to "shorten the conversation"
+  // is useless — the schemas are re-sent on every request either way.
+  const schemaDominated = toolSchemaTokenEstimate > promptTokenEstimate;
+  const breakdown = toolSchemaBytes > 0
+    ? `prompt ${promptTokenEstimate.toLocaleString('en-US')} + tool schemas ${toolSchemaTokenEstimate.toLocaleString('en-US')}`
+    : `prompt ${promptTokenEstimate.toLocaleString('en-US')}`;
+  const remedy = schemaDominated
+    ? 'Disable the MCP servers this run does not need, or use a model whose context window has room for those tool schemas.'
+    : 'Reduce the selected skills/design-system context, start a new conversation, or use a model whose context window has room for this prompt.';
 
   return {
     code: 'AGENT_PROMPT_TOO_LARGE',
     message:
       `${input.agentName} declares a ${contextWindowTokens.toLocaleString('en-US')} token context window for ${input.model}, ` +
-      `and this run's prompt already estimates at ${promptTokenEstimate.toLocaleString('en-US')} tokens before any room for the reply ` +
-      `(${limit.toLocaleString('en-US')} available). Auto-compaction only trims conversation history, so it cannot shrink a prompt that is ` +
-      'over budget on its own and would re-fire on every step instead of making progress. ' +
-      'Reduce the selected skills/design-system context, start a new conversation, or use a model whose context window has room for this prompt.',
-    bytes: input.promptBytes,
+      `and this run's static request already estimates at ${staticTokenEstimate.toLocaleString('en-US')} tokens (${breakdown}) ` +
+      `before any room for the reply (${limit.toLocaleString('en-US')} available). Auto-compaction only trims conversation history, ` +
+      'so it cannot shrink content that is re-sent on every request and would re-fire on every step instead of making progress. ' +
+      remedy,
+    bytes: input.promptBytes + toolSchemaBytes,
     limit,
     promptTokenEstimate,
     contextWindowTokens,
+    toolSchemaTokenEstimate,
   };
 }

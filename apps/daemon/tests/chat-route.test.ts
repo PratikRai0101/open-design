@@ -935,6 +935,124 @@ process.stdin.on('end', () => {
     );
   });
 
+  // Review on #9136, P1: budgeting only `composed` misses the tool schemas
+  // OpenCode resolves for the MCP servers in OPENCODE_CONFIG_CONTENT. #9118's
+  // 462,317 bytes of tool definitions were the static payload that actually
+  // blew the window, so a small prompt plus an oversized schema must still be
+  // refused before the child is spawned.
+  it('refuses a BYOK OpenCode run whose small prompt carries an oversized MCP tool schema', async () => {
+    const dataDir = process.env.OD_DATA_DIR;
+    if (!dataDir) {
+      throw new Error('OD_DATA_DIR is required for BYOK context budget tests');
+    }
+
+    const projectId = `proj-${randomUUID()}`;
+    const markerDir = await fsp.mkdtemp(join(tmpdir(), 'od-byok-mcp-schema-budget-'));
+    tempDirs.push(markerDir);
+    const spawnMarker = join(markerDir, 'opencode-spawned.txt');
+    const mcpServerPath = join(markerDir, 'oversized-schema-mcp.cjs');
+    const mcpConfigPath = join(dataDir, 'mcp-config.json');
+
+    // A minimal stdio MCP server: enough of the protocol for the preflight to
+    // list one tool whose schema alone is ~133k tokens.
+    await fsp.writeFile(
+      mcpServerPath,
+      `
+const readline = require('node:readline');
+const BIG = 'a'.repeat(400000);
+const send = (msg) => process.stdout.write(JSON.stringify(msg) + '\\n');
+readline.createInterface({ input: process.stdin }).on('line', (line) => {
+  if (!line.trim()) return;
+  let msg;
+  try { msg = JSON.parse(line); } catch { return; }
+  if (msg.id === undefined) return;
+  if (msg.method === 'initialize') {
+    send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'oversized-schema', version: '1' } } });
+    return;
+  }
+  if (msg.method === 'tools/list') {
+    send({ jsonrpc: '2.0', id: msg.id, result: { tools: [{ name: 'oversized_tool', description: BIG, inputSchema: { type: 'object', properties: {} } }] } });
+    return;
+  }
+  send({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'unsupported' } });
+});
+`,
+      'utf8',
+    );
+
+    const previousMcpConfig = await fsp
+      .readFile(mcpConfigPath, 'utf8')
+      .catch(() => null);
+    await fsp.writeFile(
+      mcpConfigPath,
+      JSON.stringify({
+        servers: [
+          {
+            id: 'oversized-schema',
+            transport: 'stdio',
+            enabled: true,
+            command: process.execPath,
+            args: [mcpServerPath],
+          },
+        ],
+      }),
+      'utf8',
+    );
+
+    try {
+      const createProjectResponse = await fetch(`${baseUrl}/api/projects`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: projectId, name: 'BYOK oversized schema fixture' }),
+      });
+      expect(createProjectResponse.ok).toBe(true);
+
+      await withFakeAgent(
+        'opencode',
+        `
+const fs = require('node:fs');
+fs.writeFileSync(${JSON.stringify(spawnMarker)}, 'spawned');
+process.stdin.resume();
+process.stdin.on('end', () => {
+  console.log(JSON.stringify({ type: 'text', part: { text: 'oversized-schema-ran' } }));
+  process.exit(0);
+});
+`,
+        async () => {
+          const response = await fetch(`${baseUrl}/api/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              agentId: 'byok-opencode',
+              projectId,
+              // Deliberately small: the text payload is nowhere near the
+              // window, so only the resolved tool schema can trip the guard.
+              message: 'hello',
+              model: 'deepseek-v4-flash',
+              byokProvider: {
+                protocol: 'senseaudio',
+                apiKey: 'sk-test-byok',
+                baseUrl: 'https://api.senseaudio.cn',
+                model: 'deepseek-v4-flash',
+                requiresApiKey: true,
+              },
+            }),
+          });
+          const body = await response.text();
+
+          expect(body).toContain('AGENT_PROMPT_TOO_LARGE');
+          expect(body).toContain('tool schemas');
+          expect(body).toMatch(/disable the MCP servers/i);
+          expect(body).not.toContain('oversized-schema-ran');
+          await expect(fsp.access(spawnMarker)).rejects.toThrow();
+        },
+      );
+    } finally {
+      if (previousMcpConfig === null) await fsp.rm(mcpConfigPath, { force: true });
+      else await fsp.writeFile(mcpConfigPath, previousMcpConfig, 'utf8');
+    }
+  });
+
   it('passes keyless BYOK provider config without auth fields to OpenCode', async () => {
     if (!process.env.OD_DATA_DIR) {
       throw new Error('OD_DATA_DIR is required for BYOK OpenCode config tests');

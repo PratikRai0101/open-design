@@ -67,6 +67,35 @@ describe('checkStaticPromptContextBudget', () => {
     expect(failure?.promptTokenEstimate).toBe(BYOK_OPENCODE_CONTEXT_TOKEN_LIMIT);
   });
 
+  // #9118's actual shape: the text prompt was nowhere near the window, but
+  // OpenCode's resolved MCP tool schemas were 462,317 bytes on every request.
+  it('refuses a small prompt whose resolved tool schemas alone exceed the window', () => {
+    const failure = checkStaticPromptContextBudget({
+      ...BYOK_RUN,
+      promptBytes: 30_000,
+      toolSchemaBytes: REPORTED_STATIC_PROMPT_BYTES,
+    });
+
+    expect(failure).not.toBeNull();
+    expect(failure?.promptTokenEstimate).toBe(10_000);
+    expect(failure?.toolSchemaTokenEstimate).toBe(154_106);
+    expect(failure?.bytes).toBe(30_000 + REPORTED_STATIC_PROMPT_BYTES);
+    expect(failure?.message).toContain('tool schemas 154,106');
+    // Advice to shorten the conversation would be useless here: the schemas
+    // are re-sent on every request no matter how the history is trimmed.
+    expect(failure?.message).toMatch(/disable the MCP servers/i);
+  });
+
+  it('stays under budget when prompt plus tool schemas still leave reply room', () => {
+    expect(
+      checkStaticPromptContextBudget({
+        ...BYOK_RUN,
+        promptBytes: 10_000,
+        toolSchemaBytes: 30_000,
+      }),
+    ).toBeNull();
+  });
+
   it('names the agent, the model, and the fix the user can act on', () => {
     const failure = checkStaticPromptContextBudget({
       ...BYOK_RUN,
