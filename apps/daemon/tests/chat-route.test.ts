@@ -869,6 +869,72 @@ process.stdin.on('end', () => {
     );
   });
 
+  // Issue #9118: a prompt already over the BYOK context window used to start
+  // the run anyway, leaving OpenCode to auto-compact a static prompt it cannot
+  // shrink — a loop that bills the provider until something external stops it.
+  it('refuses a BYOK OpenCode run whose prompt exceeds the declared context window', async () => {
+    if (!process.env.OD_DATA_DIR) {
+      throw new Error('OD_DATA_DIR is required for BYOK OpenCode config tests');
+    }
+
+    const projectId = `proj-${randomUUID()}`;
+    const markerDir = await fsp.mkdtemp(join(tmpdir(), 'od-byok-opencode-context-budget-'));
+    tempDirs.push(markerDir);
+    const spawnMarker = join(markerDir, 'opencode-spawned.txt');
+
+    const createProjectResponse = await fetch(`${baseUrl}/api/projects`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: projectId, name: 'BYOK context budget fixture' }),
+    });
+    expect(createProjectResponse.ok).toBe(true);
+
+    // 420 KB estimates at ~140k tokens, already past the 128k window the
+    // daemon declares for BYOK models before any reply room is reserved.
+    const oversizedMessage = 'x'.repeat(420_000);
+
+    await withFakeAgent(
+      'opencode',
+      `
+const fs = require('node:fs');
+fs.writeFileSync(${JSON.stringify(spawnMarker)}, 'spawned');
+process.stdin.resume();
+process.stdin.on('end', () => {
+  console.log(JSON.stringify({ type: 'text', part: { text: 'oversized-prompt-ran' } }));
+  process.exit(0);
+});
+`,
+      async () => {
+        const response = await fetch(`${baseUrl}/api/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            agentId: 'byok-opencode',
+            projectId,
+            message: oversizedMessage,
+            model: 'deepseek-v4-flash',
+            byokProvider: {
+              protocol: 'senseaudio',
+              apiKey: 'sk-test-byok',
+              baseUrl: 'https://api.senseaudio.cn',
+              model: 'deepseek-v4-flash',
+              requiresApiKey: true,
+            },
+          }),
+        });
+        const body = await response.text();
+
+        expect(body).toContain('AGENT_PROMPT_TOO_LARGE');
+        expect(body).toContain('context window');
+        expect(body).toMatch(/compaction/i);
+        // The whole point of the guard: the runtime never gets to start the
+        // compaction/continuation cycle that burns the provider balance.
+        expect(body).not.toContain('oversized-prompt-ran');
+        await expect(fsp.access(spawnMarker)).rejects.toThrow();
+      },
+    );
+  });
+
   it('passes keyless BYOK provider config without auth fields to OpenCode', async () => {
     if (!process.env.OD_DATA_DIR) {
       throw new Error('OD_DATA_DIR is required for BYOK OpenCode config tests');

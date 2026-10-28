@@ -263,8 +263,11 @@ import { TerminalControlSequenceStripper } from './runtimes/terminal-control.js'
 import { stampToolTiming } from './runtimes/tool-timing.js';
 import {
   buildOpenCodeByokProviderConfig,
+  BYOK_OPENCODE_CONTEXT_TOKEN_LIMIT,
+  BYOK_OPENCODE_OUTPUT_TOKEN_LIMIT,
   BYOK_OPENCODE_PROVIDER_REQUIRED_MESSAGE,
 } from './runtimes/byok-opencode.js';
+import { checkStaticPromptContextBudget } from './runtimes/context-window-budget.js';
 import {
   extractPlainStreamArtifacts,
   persistPlainStreamArtifactList,
@@ -14001,6 +14004,36 @@ export async function startServer({
         ),
       );
       return finishStrategyAwarePhysicalRun('failed', 1, null);
+    }
+
+    // BYOK OpenCode is the one runtime whose context window this daemon
+    // declares rather than reads (see `byok-opencode.ts`). A prompt that
+    // is already over that declared window never recovers: OpenCode
+    // answers by compacting the conversation, compaction cannot shrink
+    // the static prompt, so it re-fires on the next step and keeps
+    // charging the provider until something outside the daemon stops it
+    // (issue #9118). Refuse the run before the agent binary is spawned.
+    if (byokOpenCodeProvider) {
+      const contextWindowError = checkStaticPromptContextBudget({
+        agentName: def.name,
+        model: byokOpenCodeProvider.modelId,
+        promptBytes:
+          typeof composed === 'string' ? Buffer.byteLength(composed, 'utf8') : 0,
+        contextWindowTokens: BYOK_OPENCODE_CONTEXT_TOKEN_LIMIT,
+        outputTokenReserveTokens: BYOK_OPENCODE_OUTPUT_TOKEN_LIMIT,
+      });
+      if (contextWindowError) {
+        design.runs.emit(
+          run,
+          'error',
+          createSseErrorPayload(
+            contextWindowError.code,
+            contextWindowError.message,
+            { retryable: false },
+          ),
+        );
+        return finishStrategyAwarePhysicalRun('failed', 1, null);
+      }
     }
 
     let mmdRouteLaunchEnv = null;
