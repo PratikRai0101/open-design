@@ -1,229 +1,136 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { measureOpenCodeMcpToolSchemaBytes } from '../../src/runtimes/mcp-tool-schema-budget.js';
 
-import {
-  _resetMcpToolSchemaMeasurementCache,
-  measureOpenCodeMcpToolSchemaBytes,
-  parseJsonc,
-} from '../../src/runtimes/mcp-tool-schema-budget.js';
+const directories: string[] = [];
+afterEach(async () => {
+  for (const dir of directories.splice(0)) await rm(dir, { recursive: true, force: true });
+});
 
-let workDir: string;
-let serverScript: string;
-
-// Same shape as the config the daemon hands OpenCode via
-// OPENCODE_CONFIG_CONTENT: `mcp[id] = { type, command[], enabled }`.
-function localServerEntry(script: string, overrides: Record<string, unknown> = {}) {
-  return {
-    type: 'local',
-    command: [process.execPath, script],
-    enabled: true,
-    ...overrides,
-  };
+async function fixture(config: unknown) {
+  const dir = await mkdtemp(join(tmpdir(), 'od-config-probe-'));
+  directories.push(dir);
+  const configFile = join(dir, 'resolved.json');
+  const capture = join(dir, 'invocation.json');
+  const runner = join(dir, 'cli.cjs');
+  const command = join(dir, process.platform === 'win32' ? 'opencode.cmd' : 'opencode');
+  const script = `
+const fs = require('node:fs');
+fs.writeFileSync(${JSON.stringify(capture)}, JSON.stringify({args: process.argv.slice(2), cwd: process.cwd(), home: process.env.HOME}));
+process.stdout.write(fs.readFileSync(${JSON.stringify(configFile)}, 'utf8'));
+`;
+  await writeFile(configFile, JSON.stringify(config));
+  if (process.platform === 'win32') {
+    await writeFile(runner, script);
+    await writeFile(command, `@echo off\r\n"${process.execPath}" "${runner}" %*\r\n`);
+  } else {
+    await writeFile(command, `#!${process.execPath}\n${script}`);
+    await chmod(command, 0o755);
+  }
+  const invocation = { command, cwd: dir, env: { ...process.env, HOME: dir } };
+  return { dir, configFile, capture, invocation };
 }
 
-beforeAll(async () => {
-  workDir = await mkdtemp(join(tmpdir(), 'od-mcp-schema-budget-'));
-  serverScript = join(workDir, 'fake-mcp.cjs');
-  await writeFile(
-    serverScript,
-    `
+async function mcpServer(dir: string, options: { paginate?: boolean; expectHome?: string } = {}) {
+  const script = join(dir, 'mcp.cjs');
+  await writeFile(script, `
 const readline = require('node:readline');
-const send = (msg) => process.stdout.write(JSON.stringify(msg) + '\\n');
-readline.createInterface({ input: process.stdin }).on('line', (line) => {
-  if (!line.trim()) return;
-  let msg;
-  try { msg = JSON.parse(line); } catch { return; }
+const send = (id, result) => process.stdout.write(JSON.stringify({jsonrpc:'2.0', id, result}) + '\\n');
+readline.createInterface({ input: process.stdin }).on('line', line => {
+  const msg = JSON.parse(line);
   if (msg.id === undefined) return;
-  if (msg.method === 'initialize') {
-    send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'fake', version: '1' } } });
-    return;
-  }
-  if (msg.method === 'tools/list') {
-    send({ jsonrpc: '2.0', id: msg.id, result: { tools: [
-      { name: 'alpha', description: 'first', inputSchema: { type: 'object', properties: {} } },
-      { name: 'beta', description: 'second', inputSchema: { type: 'object', properties: { x: { type: 'string' } } } },
-    ] } });
-    return;
-  }
-  send({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'unsupported' } });
-});
-`,
-    'utf8',
-  );
-});
-
-afterAll(async () => {
-  await rm(workDir, { recursive: true, force: true });
-});
-
-beforeEach(() => {
-  _resetMcpToolSchemaMeasurementCache();
-});
-
-// `env` points HOME/XDG at an empty scratch dir unless a test supplies its own,
-// so the developer's real ~/.config/opencode never leaks into a measurement.
-type ScratchEnv = { HOME: string; XDG_CONFIG_HOME: string };
-
-async function scratchEnv(): Promise<ScratchEnv> {
-  const home = await mkdtemp(join(tmpdir(), 'od-mcp-home-'));
-  return { HOME: home, XDG_CONFIG_HOME: join(home, '.config') };
+  if (msg.method === 'initialize') return send(msg.id, { protocolVersion:'2024-11-05', capabilities:{tools:{}}, serverInfo:{name:'fixture',version:'1'} });
+  if (msg.method !== 'tools/list') return;
+  ${options.expectHome ? `if (process.env.HOME !== ${JSON.stringify(options.expectHome)}) return;` : ''}
+  if (${Boolean(options.paginate)} && !msg.params?.cursor) return send(msg.id, {tools:[], nextCursor:'page2'});
+  send(msg.id, {tools:[{name:'tool', description:'x'.repeat(400000), inputSchema:{type:'object'}}]});
+});`);
+  return { type: 'local', command: [process.execPath, script], enabled: true };
 }
 
-async function writeGlobalConfig(
-  env: ScratchEnv,
-  fileName: string,
-  contents: string,
-): Promise<string> {
-  const dir = join(env.XDG_CONFIG_HOME, 'opencode');
-  await mkdir(dir, { recursive: true });
-  const file = join(dir, fileName);
-  await writeFile(file, contents, 'utf8');
-  return file;
-}
-
-describe('parseJsonc', () => {
-  it('strips comments and trailing commas without touching strings', () => {
-    const parsed = parseJsonc(`{
-      // a line comment
-      "url": "https://example.test//not-a-comment",
-      /* a block comment */
-      "list": [1, 2, ],
-    }`);
-
-    expect(parsed).toEqual({
-      url: 'https://example.test//not-a-comment',
-      list: [1, 2],
+describe('OpenCode resolved-config preflight', () => {
+  it('asks the selected CLI for config using the exact child environment and cwd', async () => {
+    const f = await fixture({});
+    expect(await measureOpenCodeMcpToolSchemaBytes(f.invocation)).toEqual({ bytes: 0, toolCount: 0 });
+    expect(JSON.parse(await readFile(f.capture, 'utf8'))).toEqual({
+      args: ['debug', 'config'], cwd: await realpath(f.dir), home: f.dir,
     });
   });
-});
 
-describe('measureOpenCodeMcpToolSchemaBytes', () => {
-  it('measures nothing when neither config layer declares MCP servers', async () => {
-    const env = await scratchEnv();
-    for (const overlayContent of [null, undefined, '', 'not json', '{}', '{"mcp":{}}']) {
-      const measurement = await measureOpenCodeMcpToolSchemaBytes({ overlayContent, env });
-      expect(measurement).toMatchObject({
-        bytes: 0,
-        toolCount: 0,
-        measured: [],
-        unmeasuredServerIds: [],
-      });
+  it('measures a managed server returned by the runtime, regardless of file locations', async () => {
+    const f = await fixture({});
+    const server = await mcpServer(f.dir);
+    await writeFile(f.configFile, JSON.stringify({ mcp: { 'enterprise-managed': server } }));
+    const result = await measureOpenCodeMcpToolSchemaBytes(f.invocation);
+    expect(result.bytes).toBeGreaterThan(400_000);
+    expect(result.toolCount).toBe(1);
+  });
+
+  it('passes the same sandbox environment to the MCP command and includes paginated tools', async () => {
+    const f = await fixture({});
+    const server = await mcpServer(f.dir, { paginate: true, expectHome: f.dir });
+    await writeFile(f.configFile, JSON.stringify({ mcp: { sandbox: server } }));
+    const result = await measureOpenCodeMcpToolSchemaBytes(f.invocation);
+    expect(result.bytes).toBeGreaterThan(400_000);
+    expect(result.toolCount).toBe(1);
+  });
+
+  it('does not reuse stale schemas across two config resolutions', async () => {
+    const f = await fixture({});
+    const server = await mcpServer(f.dir);
+    expect((await measureOpenCodeMcpToolSchemaBytes(f.invocation)).bytes).toBe(0);
+    await writeFile(f.configFile, JSON.stringify({ mcp: { added: server } }));
+    expect((await measureOpenCodeMcpToolSchemaBytes(f.invocation)).bytes).toBeGreaterThan(400_000);
+  });
+
+  it('honors a disabled entry in the runtime-resolved configuration', async () => {
+    const f = await fixture({mcp: {disabled: {enabled: false}}});
+    expect(await measureOpenCodeMcpToolSchemaBytes(f.invocation)).toEqual({ bytes: 0, toolCount: 0 });
+  });
+
+  it('fails closed on an invalid config response without leaking its contents', async () => {
+    const f = await fixture({mcp: {broken: {headers: {authorization: 'secret-marker'}}}});
+    await expect(measureOpenCodeMcpToolSchemaBytes(f.invocation)).rejects.toThrow('Could not resolve');
+    await writeFile(f.configFile, 'secret-marker');
+    await expect(measureOpenCodeMcpToolSchemaBytes(f.invocation)).rejects.not.toThrow('secret-marker');
+  });
+
+  it('closes an SSE startup that never announces its endpoint at the deadline', async () => {
+    let announceRequest = () => {};
+    const request = new Promise<void>(resolve => { announceRequest = resolve; });
+    const server = createServer((_req, response) => {
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      response.flushHeaders();
+      announceRequest();
+      // Deliberately withhold the endpoint event: transport.start stays pending.
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('Missing HTTP address');
+    const f = await fixture({ mcp: { stalled: {type:'remote',url:`http://127.0.0.1:${address.port}/sse`} } });
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      let rejected = false;
+      const result = measureOpenCodeMcpToolSchemaBytes(f.invocation, {serverTimeoutMs:100});
+      void result.catch(() => { rejected = true; });
+      await request;
+      await vi.advanceTimersByTimeAsync(99);
+      expect(rejected).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(rejected).toBe(true);
+      await expect(result).rejects.toThrow('Could not measure');
+    } finally {
+      vi.useRealTimers();
+      server.closeAllConnections();
+      await new Promise<void>(resolve => server.close(() => resolve()));
     }
   });
 
-  it('sums the tool definitions OpenCode would re-send on every request', async () => {
-    const env = await scratchEnv();
-    const measurement = await measureOpenCodeMcpToolSchemaBytes({
-      overlayContent: JSON.stringify({
-        mcp: { 'fake-server': localServerEntry(serverScript) },
-      }),
-      env,
-    });
-
-    expect(measurement.unmeasuredServerIds).toEqual([]);
-    expect(measurement.toolCount).toBe(2);
-    expect(measurement.measured).toEqual([
-      { serverId: 'fake-server', bytes: expect.any(Number), toolCount: 2 },
-    ]);
-    expect(measurement.bytes).toBeGreaterThan(0);
-    expect(measurement.bytes).toBeLessThan(2_000);
-    expect(measurement.configSources).toEqual(['OPENCODE_CONFIG_CONTENT']);
-  });
-
-  // Review on #9136, P1: `OPENCODE_CONFIG_CONTENT` is only the daemon's layer.
-  // #9118's 462,317-byte server lived in the user's global opencode.jsonc, so
-  // a measurement that only reads the overlay reports zero and lets the run
-  // start — the exact gap this test pins.
-  it('measures a server declared only in the global opencode.jsonc', async () => {
-    const env = await scratchEnv();
-    const globalFile = await writeGlobalConfig(
-      env,
-      'opencode.jsonc',
-      `{
-        // the oversized schema from #9118 lived in a file like this one
-        "mcp": {
-          "global-only": ${JSON.stringify(localServerEntry(serverScript))},
-        },
-      }`,
-    );
-
-    const measurement = await measureOpenCodeMcpToolSchemaBytes({ overlayContent: null, env });
-
-    expect(measurement.measured.map((m) => m.serverId)).toEqual(['global-only']);
-    expect(measurement.toolCount).toBe(2);
-    expect(measurement.bytes).toBeGreaterThan(0);
-    expect(measurement.configSources).toEqual([globalFile]);
-  });
-
-  it('merges both layers and lets the daemon overlay win per server id', async () => {
-    const env = await scratchEnv();
-    await writeGlobalConfig(
-      env,
-      'opencode.json',
-      JSON.stringify({
-        mcp: {
-          shared: localServerEntry(serverScript),
-          'global-only': localServerEntry(serverScript),
-        },
-      }),
-    );
-
-    const measurement = await measureOpenCodeMcpToolSchemaBytes({
-      overlayContent: JSON.stringify({
-        // Same id as the global entry: one server, not two, and the daemon's
-        // descriptor is the one OpenCode runs.
-        mcp: { shared: localServerEntry(serverScript) },
-      }),
-      env,
-    });
-
-    expect(measurement.measured.map((m) => m.serverId).sort()).toEqual([
-      'global-only',
-      'shared',
-    ]);
-    expect(measurement.toolCount).toBe(4);
-    expect(measurement.configSources).toHaveLength(2);
-  });
-
-  it('skips a disabled server from either layer instead of spawning it', async () => {
-    const env = await scratchEnv();
-    await writeGlobalConfig(
-      env,
-      'opencode.json',
-      JSON.stringify({ mcp: { off: localServerEntry(serverScript, { enabled: false }) } }),
-    );
-
-    expect(
-      await measureOpenCodeMcpToolSchemaBytes({
-        overlayContent: JSON.stringify({
-          mcp: { 'overlay-off': localServerEntry(serverScript, { enabled: false }) },
-        }),
-        env,
-      }),
-    ).toMatchObject({ bytes: 0, toolCount: 0, measured: [], unmeasuredServerIds: [] });
-  });
-
-  // An unreachable server is neither evidence that the run fits nor evidence
-  // that it doesn't. It must be reported, never silently counted as zero bytes
-  // of tool schema.
-  it('reports an unreachable server as unmeasured rather than empty', async () => {
-    const env = await scratchEnv();
-    const measurement = await measureOpenCodeMcpToolSchemaBytes(
-      {
-        overlayContent: JSON.stringify({
-          mcp: {
-            broken: localServerEntry(join(workDir, 'does-not-exist')),
-          },
-        }),
-        env,
-      },
-      { serverTimeoutMs: 500, totalTimeoutMs: 1_000 },
-    );
-
-    expect(measurement.bytes).toBe(0);
-    expect(measurement.toolCount).toBe(0);
-    expect(measurement.unmeasuredServerIds).toEqual(['broken']);
+  it('refuses an unavailable server instead of treating it as zero tool bytes', async () => {
+    const f = await fixture({mcp: {broken: {type:'local',command:['missing-od-test-server']}}});
+    await expect(measureOpenCodeMcpToolSchemaBytes(f.invocation)).rejects.toThrow('Could not measure');
   });
 });

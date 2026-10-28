@@ -27,6 +27,7 @@ import {
   startServer,
 } from '../src/server.js';
 import { skillCwdAliasSegment } from '../src/cwd-aliases.js';
+import { resolveSandboxRuntimeConfig } from '../src/sandbox-mode.js';
 import { amrModelLoadingCache } from '../src/runtimes/amr-model-cache.js';
 import { resetLiveModelsForTests } from '../src/runtimes/models.js';
 import { getAgentDef } from '../src/agents.js';
@@ -47,7 +48,19 @@ async function withFakeAgent<T>(
   binName: string,
   script: string,
   run: () => Promise<T>,
+  configProbe = "process.stdout.write(process.env.OPENCODE_CONFIG_CONTENT || '{}');",
 ): Promise<T> {
+  // `debug config` is a metadata operation, not the generation under test.
+  // Keep the fake CLI's resolved-config response separate from its run code
+  // so a preflight probe cannot accidentally count as a generation spawn.
+  if (binName === 'opencode') {
+    script = `if (process.argv[2] === '--version') { console.log('1.0.0'); process.exit(0); }
+    if (process.argv.includes('--help')) { process.exit(0); }
+    if (process.argv[2] === 'debug' && process.argv[3] === 'config') {
+      ${configProbe}
+      process.exit(0);
+    }\n${script}`;
+  }
   const dir = await fsp.mkdtemp(join(tmpdir(), 'od-chat-route-bin-'));
   const oldPath = process.env.PATH;
   try {
@@ -897,6 +910,7 @@ process.stdin.on('end', () => {
       'opencode',
       `
 const fs = require('node:fs');
+if (process.argv[2] !== 'run') process.exit(0);
 fs.writeFileSync(${JSON.stringify(spawnMarker)}, 'spawned');
 process.stdin.resume();
 process.stdin.on('end', () => {
@@ -1011,6 +1025,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
         'opencode',
         `
 const fs = require('node:fs');
+if (process.argv[2] !== 'run') process.exit(0);
 fs.writeFileSync(${JSON.stringify(spawnMarker)}, 'spawned');
 process.stdin.resume();
 process.stdin.on('end', () => {
@@ -1053,12 +1068,10 @@ process.stdin.on('end', () => {
     }
   });
 
-  // Review on #9136, P1 (round 2): the daemon's OPENCODE_CONFIG_CONTENT is
-  // only an overlay. OpenCode keeps the user's global
-  // ~/.config/opencode/opencode.json[c] active underneath it, and #9118's
-  // 462,317-byte server lived in exactly that file — so measuring the overlay
-  // alone reports zero and lets the reported run start.
-  it('refuses a BYOK OpenCode run whose oversized tool schema comes from the global opencode config', async () => {
+  // Config policy belongs to the CLI. These fixtures return its resolved
+  // config response; HTTP assertions verify we consume it under the final env
+  // rather than reconstructing a global/managed source list in the daemon.
+  it.each(['global', 'managed', 'sandbox'] as const)('refuses an oversized %s MCP schema resolved by OpenCode before generation', async (source) => {
     if (!process.env.OD_DATA_DIR) {
       throw new Error('OD_DATA_DIR is required for BYOK context budget tests');
     }
@@ -1069,7 +1082,11 @@ process.stdin.on('end', () => {
     const spawnMarker = join(markerDir, 'opencode-spawned.txt');
     const mcpServerPath = join(markerDir, 'global-schema-mcp.cjs');
     const configHome = join(markerDir, 'xdg-config');
-    const globalConfigDir = join(configHome, 'opencode');
+    const childConfigHome = source === 'sandbox'
+      ? resolveSandboxRuntimeConfig(true, process.env.OD_DATA_DIR).roots.configDir
+      : configHome;
+    const globalConfigDir = join(childConfigHome, 'opencode');
+    const probeCapture = join(markerDir, 'probe-env.json');
 
     await fsp.writeFile(
       mcpServerPath,
@@ -1096,26 +1113,17 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
       'utf8',
     );
 
-    // A real OpenCode global config, JSONC and all: this is where #9118's
-    // oversized server was declared.
     await fsp.mkdir(globalConfigDir, { recursive: true });
-    await fsp.writeFile(
-      join(globalConfigDir, 'opencode.jsonc'),
-      `{
-        // user-configured global MCP server
-        "mcp": {
-          "global-oversized": {
-            "type": "local",
-            "command": [${JSON.stringify(process.execPath)}, ${JSON.stringify(mcpServerPath)}],
-            "enabled": true,
-          },
-        },
-      }`,
-      'utf8',
-    );
-
+    const responseFile = join(globalConfigDir, `resolved-${source}.json`);
+    await fsp.writeFile(responseFile, JSON.stringify({
+      mcp: { [source]: {
+        type: 'local', command: [process.execPath, mcpServerPath], enabled: true,
+      } },
+    }));
     const previousXdgConfigHome = process.env.XDG_CONFIG_HOME;
+    const previousSandboxMode = process.env.OD_SANDBOX_MODE;
     process.env.XDG_CONFIG_HOME = configHome;
+    if (source === 'sandbox') process.env.OD_SANDBOX_MODE = '1';
     try {
       const createProjectResponse = await fetch(`${baseUrl}/api/projects`, {
         method: 'POST',
@@ -1128,6 +1136,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
         'opencode',
         `
 const fs = require('node:fs');
+if (process.argv[2] !== 'run') process.exit(0);
 fs.writeFileSync(${JSON.stringify(spawnMarker)}, 'spawned');
 process.stdin.resume();
 process.stdin.on('end', () => {
@@ -1159,11 +1168,20 @@ process.stdin.on('end', () => {
           expect(body).toContain('tool schemas');
           expect(body).not.toContain('global-schema-ran');
           await expect(fsp.access(spawnMarker)).rejects.toThrow();
+          const probeEnv = JSON.parse(await fsp.readFile(probeCapture, 'utf8'));
+          expect(probeEnv.configHome).toBe(childConfigHome);
         },
+        `const fs = require('node:fs');
+         const path = require('node:path');
+         fs.writeFileSync(${JSON.stringify(probeCapture)}, JSON.stringify({configHome: process.env.XDG_CONFIG_HOME}));
+         process.stdout.write(fs.readFileSync(path.join(process.env.XDG_CONFIG_HOME, 'opencode', ${JSON.stringify(`resolved-${source}.json`)}), 'utf8'));`,
       );
     } finally {
+      await fsp.rm(responseFile, { force: true });
       if (previousXdgConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
       else process.env.XDG_CONFIG_HOME = previousXdgConfigHome;
+      if (previousSandboxMode === undefined) delete process.env.OD_SANDBOX_MODE;
+      else process.env.OD_SANDBOX_MODE = previousSandboxMode;
     }
   });
 

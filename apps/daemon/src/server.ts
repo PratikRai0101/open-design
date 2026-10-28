@@ -14007,61 +14007,6 @@ export async function startServer({
       return finishStrategyAwarePhysicalRun('failed', 1, null);
     }
 
-    // BYOK OpenCode is the one runtime whose context window this daemon
-    // declares rather than reads (see `byok-opencode.ts`). A request that
-    // is already over that declared window never recovers: OpenCode answers
-    // by compacting the conversation, compaction cannot shrink content that
-    // is re-sent on every request, so it re-fires on the next step and keeps
-    // charging the provider until something outside the daemon stops it
-    // (issue #9118). Refuse the run before the agent binary is spawned.
-    //
-    // `composed` is only the daemon's text payload. OpenCode resolves the
-    // MCP tool schemas itself from `OPENCODE_CONFIG_CONTENT`, and in #9118
-    // those schemas alone were 462,317 bytes — larger than the window — so
-    // budgeting the prompt alone would have let the reported run through.
-    // Ask each configured server for its `tools/list` payload first.
-    if (byokOpenCodeProvider) {
-      // `opencodeConfigContent` is only the daemon's layer. OpenCode keeps the
-      // user's global `~/.config/opencode/opencode.json[c]` active underneath
-      // it, and in #9118 the 462,317-byte server lived in exactly that file —
-      // so the budget has to cover the merged set, resolved against the env the
-      // child will actually spawn with.
-      const toolSchemaMeasurement = await measureOpenCodeMcpToolSchemaBytes({
-        overlayContent: opencodeConfigContent,
-        env: { ...process.env, ...(def.env || {}), ...configuredAgentEnv },
-      });
-      if (toolSchemaMeasurement.unmeasuredServerIds.length > 0) {
-        // The budget below cannot see these servers' tool schemas, so it
-        // cannot clear them either. Name the blind spot rather than let the
-        // guard look like it covered them.
-        console.warn(
-          '[byok-context-budget] tool schemas unmeasured for MCP servers:',
-          toolSchemaMeasurement.unmeasuredServerIds.join(', '),
-        );
-      }
-      const contextWindowError = checkStaticPromptContextBudget({
-        agentName: def.name,
-        model: byokOpenCodeProvider.modelId,
-        promptBytes:
-          typeof composed === 'string' ? Buffer.byteLength(composed, 'utf8') : 0,
-        toolSchemaBytes: toolSchemaMeasurement.bytes,
-        contextWindowTokens: BYOK_OPENCODE_CONTEXT_TOKEN_LIMIT,
-        outputTokenReserveTokens: BYOK_OPENCODE_OUTPUT_TOKEN_LIMIT,
-      });
-      if (contextWindowError) {
-        design.runs.emit(
-          run,
-          'error',
-          createSseErrorPayload(
-            contextWindowError.code,
-            contextWindowError.message,
-            { retryable: false },
-          ),
-        );
-        return finishStrategyAwarePhysicalRun('failed', 1, null);
-      }
-    }
-
     let mmdRouteLaunchEnv = null;
     if (def.id === 'claude' && safeModel) {
       mmdRouteLaunchEnv = await loadMmdRouteLaunchEnv(
@@ -15119,6 +15064,32 @@ export async function startServer({
           await applyOpenCodeEventPlugin(env, RUNTIME_DATA_DIR, versions?.agentCliVersion, agentSpawnEnv.OPENCODE_CONFIG_CONTENT);
         } catch (error) {
           console.warn('[opencode] optional tool previews unavailable:', error instanceof Error ? error.message : String(error));
+        }
+      }
+      if (byokOpenCodeProvider) {
+        // Resolve using the selected binary and the exact finalized spawn
+        // environment/cwd: sandbox homes, expanded paths, launch overrides,
+        // MCP overlay, and event plugin are all applied by this point.
+        const measurement = await measureOpenCodeMcpToolSchemaBytes({
+          command: agentLaunch.launchPath,
+          env,
+          cwd: effectiveCwd,
+        });
+        const budgetError = checkStaticPromptContextBudget({
+          agentName: def.name,
+          model: byokOpenCodeProvider.modelId,
+          promptBytes: typeof composed === 'string' ? Buffer.byteLength(composed, 'utf8') : 0,
+          toolSchemaBytes: measurement.bytes,
+          contextWindowTokens: BYOK_OPENCODE_CONTEXT_TOKEN_LIMIT,
+          outputTokenReserveTokens: BYOK_OPENCODE_OUTPUT_TOKEN_LIMIT,
+        });
+        if (budgetError) {
+          cleanupPromptFile();
+          revokeToolToken('child_exit');
+          unregisterChatAgentEventSink();
+          cleanupOdNextRunInputProjection();
+          send('error', createSseErrorPayload(budgetError.code, budgetError.message, { retryable: false }));
+          return finishStrategyAwarePhysicalRun('failed', 1, null);
         }
       }
       // Version detection and plugin staging above can yield while a cancel
