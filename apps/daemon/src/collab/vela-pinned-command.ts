@@ -1,5 +1,6 @@
 import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { readAmrEndpointBinding, registerPinnedAmrCredentialHome } from '../integrations/amr-endpoint-binding.js';
 import { runVelaCommand } from '../integrations/vela-command.js';
 import type { VelaControlApiContext } from '../integrations/vela.js';
 import { safeVelaCommandError } from './public-file-failure.js';
@@ -60,9 +61,11 @@ export async function runPinnedVelaCommand(
     await cleanupAbandonedPinnedVelaSessions(dataRoot);
     const home = await mkdtemp(path.join(dataRoot, `vela-session-v1-${process.pid}-`));
     let commandRejected = false;
+    let releasePinnedHome = () => {};
     try {
+      releasePinnedHome = registerPinnedAmrCredentialHome(home, input.session);
       await writeFile(path.join(home, 'config.json'), JSON.stringify({
-        profiles: { [profile]: { controlKey, apiUrl } },
+        profiles: { [profile]: { controlKey, apiUrl, linkUrl: readAmrEndpointBinding()?.linkUrl } },
       }), { mode: 0o600, flag: 'wx' });
       preparing = false;
       return await run(args, {
@@ -73,12 +76,15 @@ export async function runPinnedVelaCommand(
           VELA_API_URL: apiUrl,
           VELA_WORKSPACE_ID: workspaceId,
         },
-        timeoutMs: 30_000,
+        // Blob transfer plus commit may exceed a short control-command budget.
+        // Bound the complete upload command; retain normal control deadlines.
+        timeoutMs: args[0] === 'resource' && args[1] === 'push' ? 600_000 : 30_000,
       });
     } catch (error) {
       commandRejected = true;
       throw error;
     } finally {
+      releasePinnedHome();
       try {
         await rm(home, { recursive: true, force: true });
       } catch (error) {

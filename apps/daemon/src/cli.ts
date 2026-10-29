@@ -102,7 +102,7 @@ const MEDIA_SCAFFOLD_STRING_FLAGS = new Set([
 ]);
 const MEDIA_SCAFFOLD_BOOLEAN_FLAGS = new Set(['help', 'h', 'json']);
 const MEDIA_STOCK_SEARCH_STRING_FLAGS = new Set(['slots', 'slots-file', 'out-dir', 'budget-ms', 'timeout-ms', 'concurrency', 'project', 'workspace', 'workspace-member', 'daemon-url']);
-const MEDIA_STOCK_SEARCH_BOOLEAN_FLAGS = new Set(['help', 'h']);
+const MEDIA_STOCK_SEARCH_BOOLEAN_FLAGS = new Set(['help', 'h', 'json']);
 
 const MCP_STRING_FLAGS = new Set([
   'daemon-url',
@@ -2581,7 +2581,7 @@ function printMediaHelp() {
   console.log(`Usage: od media models [--cloud --project <id>] --json
        od media scaffold --composition-dir .hyperframes-cache/<id> [opts]
        od media generate --surface <image|video|audio> --model <id> [opts]
-       od media stock-search --slots '<json>' [opts]
+       od media stock-search --slots '<json>' [--json] [opts]
        "$OD_NODE_BIN" "$OD_BIN" media generate --surface <image|video|audio> --model <id> [opts]
 
 Scaffold:
@@ -7382,7 +7382,7 @@ function printProjectShareHelp() {
                     "link temporarily unavailable" plus its slug, and no URL.
                     When AMR cannot be reached, the last known link is shown
                     with a stale notice on stderr ("stale": true in --json).
-  od project share status <id> [--path <file>] [--json]
+  od project share status <id> [--path <file>] [--local-only] [--json]
                     Project binding history, or file lifecycle with --path.
   od project share stop <id> --path <file> --slug <slug> [--json]
                     Stop the stable public alias; its identity is retained for resume.
@@ -7443,7 +7443,7 @@ async function runProjectShare(args) {
     ...(['stop', 'retry-stop'].includes(action) ? ['slug'] : [])]);
   let flags;
   try {
-    flags = parseFlags(rest, { string: stringFlags, boolean: new Set(['json']) });
+    flags = parseFlags(rest, { string: stringFlags, boolean: new Set(['json', 'local-only']) });
   } catch {
     console.error('Usage: od project share <preflight|publish|resume|get|status|stop|retry-stop> <id> --path <file> [--json] (stop requires --slug <slug>). See --help for accepted flags.');
     process.exit(2);
@@ -7459,13 +7459,16 @@ async function runProjectShare(args) {
     console.error('Usage: od project share <preflight|publish|resume|get|status|stop|retry-stop> <id> --path <file> [--json] (stop requires --slug <slug>)');
     process.exit(2);
   }
+  if (flags['local-only'] && (action !== 'get' || !filePath)) {
+    console.error('--local-only requires share get/status with --path'); process.exit(2);
+  }
   // Validate before discovery; malformed invocations must not contact a daemon.
   const headers = workspaceHeadersFromExplicitFlags(flags) ?? {};
   const base = (await projectDaemonUrl(flags)).replace(/\/$/, '');
   let resp;
   try {
     resp = await fetch(
-      projectStatus ? `${base}/api/projects/${encodeURIComponent(id)}/share-state` : action === 'retry-stop' ? `${base}/api/public-file-stops/retry` : `${base}/api/projects/${encodeURIComponent(id)}/files/${encodeURIComponent(filePath)}/${action === 'preflight' ? 'share-plan' : 'publish-public'}`,
+      projectStatus ? `${base}/api/projects/${encodeURIComponent(id)}/share-state` : action === 'retry-stop' ? `${base}/api/public-file-stops/retry` : `${base}/api/projects/${encodeURIComponent(id)}/files/${encodeURIComponent(filePath)}/${action === 'preflight' ? 'share-plan' : 'publish-public'}${flags['local-only'] ? '?localOnly=true' : ''}`,
       action === 'retry-stop'
         ? { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ projectId: id, filePath, slug }) }
         : action === 'stop'
@@ -7500,6 +7503,7 @@ async function runProjectShare(args) {
   const blockers = action === 'preflight' && Array.isArray(data?.blockers) ? data.blockers : [];
   if (blockers.length) process.exitCode = 1;
   if (flags.json) return process.stdout.write(JSON.stringify(data, null, 2) + '\n');
+  if (flags['local-only']) return console.log(`Local share content: ${data.freshness ?? 'unknown'}`);
   if (projectStatus) return console.log(JSON.stringify(data, null, 2));
   if (action === 'preflight') {
     console.log(`Share plan: ${data.fileCount} files, ${data.totalBytes} bytes.`);
@@ -7564,7 +7568,7 @@ async function runProject(args) {
                     Resume sharing through the same stable-alias lifecycle as the UI.
   od project share get <id> --path <file> [--json]
                     Read the current publication.
-  od project share status <id> [--path <file>] [--json]
+  od project share status <id> [--path <file>] [--local-only] [--json]
                     Project binding history, or file lifecycle with --path.
   od project share stop <id> --path <file> --slug <slug> [--json]
                     Stop the stable public alias; its identity is retained for resume.
@@ -8092,8 +8096,8 @@ Common options:
   --daemon-url <url>   OpenDesign daemon HTTP base.
   --member <id>        Workspace member id for route-level authorization.
   --role <role>        Workspace role: owner, admin, or member.
-  --workspace-type <t> personal or team. A team share is refused in a personal
-                       workspace, which has no team plane to share into.
+  --workspace-type <t> personal or team. Shared projects and resources stay
+                       scoped to the selected workspace and active member.
   --json               Emit raw JSON.`);
     process.exit(args.length === 0 ? 2 : 0);
   }
@@ -8157,6 +8161,18 @@ Common options:
   // explicit CLI argument, never daemon active-workspace state: account is the
   // compatibility default; team requires both type + workspace id.
   if (area === 'billing') {
+    if (sub === 'request-concurrency') {
+      const workspaceId = typeof flags.workspace === 'string' ? flags.workspace.trim() : '';
+      if (!workspaceId) {
+        console.error('Usage: od workspace billing request-concurrency --workspace <id> [--json]');
+        process.exit(2);
+      }
+      const query = new URLSearchParams({ workspaceId });
+      const data = await workspaceContextRequest(`/api/workspace/billing/request-concurrency?${query}`);
+      if (flags.json) return process.stdout.write(JSON.stringify(data, null, 2) + '\n');
+      console.log(`Request concurrency: ${data.requestConcurrencyHint?.status ?? 'unknown'} (Link decides admission)`);
+      return;
+    }
     if (sub === 'preflight') {
       const workspaceId = typeof flags.workspace === 'string' ? flags.workspace.trim() : '';
       if (!workspaceId) {
@@ -8267,12 +8283,8 @@ Common options:
   }
   const workspaceHeaders = {
     'x-od-workspace-id': workspaceId,
-    // Only sent when the caller actually says which kind of workspace this is.
-    // The daemon reads an explicit `personal` as the caller ASSERTING there is
-    // no team plane here and refuses a team share on the strength of it (see
-    // collab/team-share-scope.ts), so defaulting the header to 'personal' would
-    // have made `--visibility team` impossible from the CLI. Absent still reads
-    // as personal everywhere it only affects view filtering.
+    // Preserve an explicit workspace type; the daemon verifies workspace and
+    // membership authority for both Personal and Team shared resources.
     ...(typeof flags['workspace-type'] === 'string' && flags['workspace-type'].trim()
       ? { 'x-od-workspace-type': flags['workspace-type'].trim() }
       : {}),
